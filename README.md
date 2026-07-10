@@ -151,6 +151,5 @@ curl -X POST [http://127.0.0.1:8000/api/sync](http://127.0.0.1:8000/api/sync)
 
 4. Click **Save** and **Refresh**.
 5. Select the model **`oh-hybrid-local`** from the chat dropdown and start controlling your home!
-```
 
 ---
