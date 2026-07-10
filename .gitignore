@@ -1,0 +1,30 @@
+# Python temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+bin/
+include/
+lib/
+lib64/
+lib64
+pyvenv.cfg
+share/
+
+# App specific data
+chroma_db/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# git
+.git/
