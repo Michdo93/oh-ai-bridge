@@ -1,0 +1,85 @@
+# =====================================================================
+# synonyms.yaml — admin-pflegbares Wörterbuch für die oh-ai-bridge
+# =====================================================================
+# Diese Datei ist bewusst simpel (Liste statt DB-Tabellen wie im
+# "Chatbot für openHAB.md"-Konzept), weil wir ressourcenschonend und
+# ohne zusätzliche DB/Trainings-UI bleiben wollen. Trotzdem deckt sie
+# genau die dort beschriebenen Anforderungen ab: Synonyme + Fuzzy-
+# Matching-Vokabular für Räume, Gerätetypen und Aktionen.
+#
+# WICHTIG: Räume & Gerätetypen kommen primär LIVE aus openHAB selbst
+# (Semantic Model via /rest/tags + Item-Tags/Gruppen, siehe app.py).
+# Diese Datei ist nur die ERGÄNZUNG:
+#   1) Fallback, falls dein openHAB älter als 4.0 ist oder /rest/tags
+#      nicht verfügbar/aktiviert ist.
+#   2) Zusätzliche eigene Wörter/Umgangssprache, die openHAB selbst
+#      nicht als Synonym kennt (Slang, Abkürzungen, Tippfehler-Fixes).
+# Beide Quellen werden beim Sync gemerged (Union der Wortlisten).
+#
+# Tag-Namen (equipment/location) MÜSSEN mit den openHAB Semantic-Tag-
+# Bezeichnern übereinstimmen (z.B. "Lightbulb", "Bedroom"), damit das
+# Merging funktioniert. Schau bei Unsicherheit in /api/tags (Debug-
+# Endpoint der Bridge) nach, was dein System tatsächlich liefert.
+
+equipment:
+  Lightbulb: [licht, lampe, leuchte, beleuchtung, lämpchen, deckenlampe, stehlampe, spot, strahler]
+  LightStripe: [lichtband, lichtleiste, ledstreifen, led streifen]
+  Blinds: [rollo, rolladen, rollladen, jalousie, beschattung, markise]
+  Lock: [schloss, türschloss, verriegelung]
+  Door: [tür, türe, eingangstür, haustür]
+  Window: [fenster]
+  Valve: [ventil, heizungsventil]
+  Thermostat: [heizung, thermostat, heizkörper, heizungsregler]
+  Television: [fernseher, tv, fernsehen]
+  Speaker: [lautsprecher, box, boxen, sonos, musikanlage]
+  MediaPlayer: [musik, player, medienplayer]
+  CoffeeMaker: [kaffeemaschine, kaffeevollautomat, kaffee]
+  Oven: [ofen, backofen]
+  Dishwasher: [spülmaschine, geschirrspüler]
+  Refrigerator: [kühlschrank, kuehlschrank]
+  Freezer: [gefrierschrank, gefriertruhe]
+  Fan: [ventilator, lüfter, lueffter]
+  Sensor: [sensor, melder]
+  SmokeDetector: [rauchmelder]
+  MotionDetector: [bewegungsmelder, bewegungssensor]
+  PowerOutlet: [steckdose, stecker]
+  WebService: [dienst, service]
+  Camera: [kamera, überwachungskamera]
+  Alarm: [alarm, alarmanlage]
+
+location:
+  Bedroom: [schlafzimmer]
+  Bathroom: [bad, badezimmer]
+  Kitchen: [küche, kueche]
+  LivingRoom: [wohnzimmer]
+  Office: [büro, buero, arbeitszimmer]
+  Corridor: [flur, gang, diele]
+  Garden: [garten]
+  Basement: [keller]
+  Attic: [dachboden, speicher]
+  Garage: [garage]
+  Entry: [eingang, eingangsbereich]
+  DiningRoom: [esszimmer]
+  Balcony: [balkon]
+  Terrace: [terrasse]
+  Cellar: [keller]
+  GuestRoom: [gästezimmer, gaestezimmer]
+  ChildsRoom: [kinderzimmer]
+  LaundryRoom: [waschküche, waschkueche, hauswirtschaftsraum]
+  # 'Smart-Home-Labor' o.ä. individuelle Räume kannst du hier einfach
+  # ergänzen, auch wenn es kein offizieller openHAB-Tag ist:
+  Lab: [labor, smart-home-labor, smart home labor]
+
+# Aktionen sind KEIN Teil des openHAB Semantic Models (das beschreibt nur
+# WAS ein Gerät ist, nicht WIE man es befehligt) -> muss immer hier
+# gepflegt werden.
+actions:
+  ON: [an, ein, einschalten, aktivieren, starte, mach an, mach ein, öffne, oeffne]
+  OFF: [aus, ausschalten, deaktivieren, stoppe, mach aus, schließe, schliesse]
+  UP: [hoch, rauf, hochfahren, oeffnen]
+  DOWN: [runter, herunter, herunterfahren]
+  STATUS: [status, zustand, wie, wert, ist, sind, hat, läuft, laeuft, gibt, warm, kalt, grad, temperatur, prozent]
+
+# Schwellenwerte für Fuzzy-Matching (RapidFuzz token_sort_ratio, 0-100)
+fuzzy:
+  min_score: 82
