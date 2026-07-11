@@ -369,7 +369,7 @@ def sync_items_to_vector_db():
             f"{OPENHAB_URL}/rest/items",
             headers=HEADERS_JSON,
             params={"metadata": ".+"},
-            timeout=60,
+            timeout=180,  # bei mehreren Zehntausend Items (s. items_total) reichen 60s oft nicht
         )
         response.raise_for_status()
         items = response.json()
@@ -444,7 +444,14 @@ def sync_items_to_vector_db():
             metadatas=metadatas[i:i + batch_size],
         )
 
-    rebuild_item_cache()
+    # WICHTIG: Cache direkt aus den bereits im Speicher vorhandenen Sync-
+    # Daten aufbauen, statt sie per collection.get() aus Chroma erneut zu
+    # holen. Ein bare collection.get() über sehr viele Items (hier: 47.780)
+    # kann in Chroma an interne Limits stoßen ("Error executing plan").
+    # Der teure, paginierte collection.get()-Weg (rebuild_item_cache) bleibt
+    # als Fallback für den Server-Neustart erhalten, wo kein In-Memory-Stand
+    # existiert.
+    set_item_cache(metadatas)
     classified = sum(1 for m in metadatas if m["location_tag"] or m["equipment_tag"] or m["property_tag"])
     log.info("[SYNC] Synchronisierung abgeschlossen.")
     return {
@@ -505,19 +512,49 @@ def get_openhab_state(item_name: str) -> str:
 # =====================================================================
 ITEM_CACHE: List[Dict[str, Any]] = []
 ITEM_NAMES: Set[str] = set()
+ITEM_BY_NAME: Dict[str, Dict[str, Any]] = {}
+
+# Chroma's bare collection.get() can fail on very large collections ("Error
+# executing plan: Internal error") -- fetch in bounded pages instead.
+CACHE_PAGE_SIZE = 2000
+
+
+def set_item_cache(metadatas: List[Dict[str, Any]]):
+    """Baut den In-Memory-Cache direkt aus bereits geladenen Metadaten auf
+    (z.B. unmittelbar nach einem Sync) -- ohne erneuten Chroma-Request."""
+    global ITEM_CACHE, ITEM_NAMES, ITEM_BY_NAME
+    ITEM_CACHE = [dict(m) for m in metadatas]
+    ITEM_NAMES = {m["name"] for m in ITEM_CACHE}
+    ITEM_BY_NAME = {m["name"]: m for m in ITEM_CACHE}
+    log.info(f"[CACHE] {len(ITEM_CACHE)} Items im Speicher-Cache (direkt aus Sync).")
 
 
 def rebuild_item_cache():
-    global ITEM_CACHE, ITEM_NAMES
+    """Lädt den Cache paginiert aus Chroma -- nötig nach einem Server-
+    Neustart, wenn kein In-Memory-Stand aus einem gerade gelaufenen Sync
+    existiert (Chroma selbst ist persistent, der Python-Cache nicht)."""
+    global ITEM_CACHE, ITEM_NAMES, ITEM_BY_NAME
+    items: List[Dict[str, Any]] = []
     try:
-        data = collection.get(include=["metadatas"])
-        ITEM_CACHE = [dict(m, id=i) for i, m in zip(data["ids"], data["metadatas"])]
+        total = collection.count()
+        offset = 0
+        while offset < total:
+            page = collection.get(include=["metadatas"], limit=CACHE_PAGE_SIZE, offset=offset)
+            page_ids = page.get("ids", [])
+            page_metas = page.get("metadatas", [])
+            if not page_ids:
+                break
+            items.extend(dict(m) for m in page_metas)
+            offset += len(page_ids)
+        ITEM_CACHE = items
         ITEM_NAMES = {m["name"] for m in ITEM_CACHE}
-        log.info(f"[CACHE] {len(ITEM_CACHE)} Items im Speicher-Cache.")
+        ITEM_BY_NAME = {m["name"]: m for m in ITEM_CACHE}
+        log.info(f"[CACHE] {len(ITEM_CACHE)} Items paginiert aus Chroma geladen.")
     except Exception as e:
         log.warning(f"[CACHE] Konnte Item-Cache nicht laden ({e}). Erst /api/sync ausführen.")
         ITEM_CACHE = []
         ITEM_NAMES = set()
+        ITEM_BY_NAME = {}
 
 
 ACTIONABLE_TYPES_ON_OFF = {"Switch", "Dimmer", "Color", "Rollershutter"}
@@ -592,10 +629,7 @@ def find_exact_item_reference(user_query: str) -> Optional[str]:
 
 
 def get_item_meta(item_name: str) -> Optional[Dict[str, Any]]:
-    for it in ITEM_CACHE:
-        if it["name"] == item_name:
-            return it
-    return None
+    return ITEM_BY_NAME.get(item_name)
 
 
 # =====================================================================
@@ -620,16 +654,42 @@ def extract_numeric_command(user_query: str) -> Optional[str]:
 #     solange mindestens eine Dimension aus der Query aufgelöst wurde)
 # =====================================================================
 def rank_candidates(normalized_query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rankt NUR innerhalb der bereits gefilterten (kleinen) Kandidatenliste.
+    Fragt Chroma gezielt über 'where name $in [...]' ab, NIEMALS über den
+    gesamten Bestand (bei 47.780 Items wäre n_results=len(ITEM_CACHE) eine
+    Katastrophe für CPU-Zeit und Speicher)."""
     if len(candidates) <= 1:
         return candidates
     names = [c["name"] for c in candidates]
     try:
-        results = collection.query(query_texts=[normalized_query], n_results=len(ITEM_CACHE) or 1)
+        results = collection.query(
+            query_texts=[normalized_query],
+            n_results=len(names),
+            where={"name": {"$in": names}},
+        )
         order = {name: idx for idx, name in enumerate(results["ids"][0])}
-        return sorted(candidates, key=lambda c: order.get(c["name"], len(order)))
+        ranked = sorted(candidates, key=lambda c: order.get(c["name"], len(order)))
+        # Falls Chroma aus irgendeinem Grund weniger/andere IDs zurückgibt
+        # als erwartet, nicht blind vertrauen -- nur übernehmen, wenn wirklich
+        # alle Kandidaten im Ranking auftauchen.
+        if len(order) >= len(candidates):
+            return ranked
+        return candidates
     except Exception as e:
         log.warning(f"[RANK] Vektor-Ranking fehlgeschlagen ({e}), behalte Cache-Reihenfolge.")
         return candidates
+
+
+def free_vector_fallback(normalized_query: str, n: int = 5) -> List[Dict[str, Any]]:
+    """Letzter Ausweg, wenn aus der Anfrage GAR kein Raum-/Geräte-Wort
+    aufgelöst werden konnte: klassische, eng begrenzte Vektorsuche über den
+    Gesamtbestand (n klein halten -- bei 47.780 Items keine großen n_results!)."""
+    try:
+        results = collection.query(query_texts=[normalized_query], n_results=n)
+        return [ITEM_BY_NAME[i] for i in results["ids"][0] if i in ITEM_BY_NAME]
+    except Exception as e:
+        log.warning(f"[RANK] Freie Vektorsuche fehlgeschlagen ({e}).")
+        return []
 
 
 CLARIFY_MAX_OPTIONS = 4
@@ -679,14 +739,15 @@ def resolve_single_query(user_query: str, last_item_hint: Optional[str]) -> str:
     if not candidates:
         if not device_tags and not location_tags:
             # Wir kennen wirklich kein Wort aus der Anfrage -> letzter Ausweg:
-            # freie Vektorsuche über den ganzen Bestand (wie in v3).
-            candidates = rank_candidates(normalized_query, list(ITEM_CACHE))[:3]
+            # eng begrenzte freie Vektorsuche (klein halten, s.o.), NICHT
+            # über rank_candidates() mit dem kompletten Bestand.
+            candidates = free_vector_fallback(normalized_query, n=3)
             if not candidates:
                 return "Ich konnte kein passendes Gerät finden. Nenne mir gerne Gerätetyp und/oder Raum genauer."
         else:
             return "Ich konnte kein Gerät finden, das zu Raum/Gerätetyp deiner Anfrage passt. Prüfe ggf. mit /api/tags, ob dieser Raum/Gerätetyp bekannt ist."
-
-    candidates = rank_candidates(normalized_query, candidates)
+    else:
+        candidates = rank_candidates(normalized_query, candidates)
 
     if len(candidates) > 1:
         top, second = candidates[0], candidates[1]
