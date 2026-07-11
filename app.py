@@ -237,8 +237,31 @@ def resolve_tags(normalized_query: str, synonym_table: Dict[str, Set[str]]) -> S
 
 
 def resolve_action(query_lower: str) -> Optional[str]:
-    if query_lower.strip().startswith(("sind ", "ist ", "hat ", "läuft ", "laeuft ", "gibt ")):
+    # 0. "Welche Geräte/Lampen/Items gibt es...": Aufzählung statt Einzel-Item.
+    #    Muss VOR dem STATUS-Check laufen ("gibt es" würde sonst als STATUS-
+    #    Präfix erkannt werden).
+    if query_lower.strip().startswith("welche") or any(
+        p in query_lower for p in ["was gibt es", "was kannst du steuern", "welche gibt es"]
+    ):
+        return "LIST"
+
+    # 1. Direkte openHAB-Kommandos als eigenständige Wörter erkennen (Power-
+    #    User-Syntax: "Sende ON an X", "schalten ON", "Command OFF"). Das ist
+    #    KEIN Teil der deutschen Synonym-Liste, weil ON/OFF/UP/DOWN feste,
+    #    sprachunabhängige openHAB-Befehlsnamen sind, keine Umgangssprache.
+    tokens = re.findall(r"[a-z]+", query_lower)
+    token_set = set(tokens)
+    direct = {
+        "on": "ON", "off": "OFF", "up": "UP", "down": "DOWN",
+    }
+    for word, mapped in direct.items():
+        if word in token_set:
+            return mapped
+
+    # 2. Fragen ("ist ... an?") haben Vorrang vor reinen An/Aus-Wörtern.
+    if query_lower.strip().startswith(("sind ", "ist ", "hat ", "läuft ", "laeuft ", "gibt ", "wie ", "was ")):
         return "STATUS"
+
     for action in ["STATUS", "OFF", "ON", "UP", "DOWN"]:
         words = ACTION_WORDS.get(action, set())
         if any(w in query_lower for w in words if w):
@@ -422,6 +445,13 @@ def sync_items_to_vector_db():
         # (Signalquelle B) -- unabhängig davon, ob die semantische
         # Klassifizierung (Signalquelle A) funktioniert hat.
         match_text = normalize_text(f"{name} {label} {tags_str} {groups_str}")
+        # match_tokens: Wort-Grenzen-sichere Tokens (per Regex getrennt).
+        # WICHTIG: verhindert False Positives durch zufällige Substrings in
+        # zusammengeschriebenen Titeln/Namen, z.B. steckt "licht" rein
+        # zeichenweise in "Herzlichtutmichverlangen" (Bach-Kantatentitel ohne
+        # Leerzeichen) -- als eigenständiges TOKEN kommt "licht" darin aber
+        # nicht vor, nur als Substring mitten in einem viel längeren Token.
+        match_tokens = " ".join(re.findall(r"[a-z0-9]+", match_text))
 
         ids.append(name)
         documents.append(semantic_text)
@@ -433,6 +463,7 @@ def sync_items_to_vector_db():
             "equipment_tag": sem["equipment_tag"] or "",
             "property_tag": sem["property_tag"] or "",
             "match_text": match_text,
+            "match_tokens": match_tokens,
         })
 
     batch_size = 5000
@@ -560,46 +591,138 @@ def rebuild_item_cache():
 ACTIONABLE_TYPES_ON_OFF = {"Switch", "Dimmer", "Color", "Rollershutter"}
 
 
+def _token_hits(tokens_str: str, words: Set[str]) -> bool:
+    """Wort-Grenzen-sicherer Treffer: exaktes Token, Token-Präfix (Plural wie
+    'lampen' vs. 'lampe'), oder Fuzzy nur zwischen ähnlich LANGEN Tokens.
+    Die Längen-Bremse verhindert genau den Bach-Kantaten-Fall: ein 25 Zeichen
+    langes Token wird nicht mehr fälschlich gegen ein 5-Zeichen-Wort wie
+    'licht' gematcht, egal was rapidfuzz sonst an Teilstring-Heuristiken macht."""
+    for token in tokens_str.split():
+        for w in words:
+            if not w:
+                continue
+            if token == w:
+                return True
+            if len(w) >= 4 and token.startswith(w):
+                return True
+            if abs(len(token) - len(w)) <= 2 and fuzz.ratio(token, w) >= FUZZY_MIN_SCORE:
+                return True
+    return False
+
+
 def filter_candidates(
     device_tags: Set[str],
     location_tags: Set[str],
     action: Optional[str],
 ) -> List[Dict[str, Any]]:
-    """Harter Python-Filter über den Item-Cache. Beide Signalquellen (A:
-    aufgelöste Tags, B: Substring im match_text) zählen unabhängig
-    voneinander -- ein Item muss NUR eine davon erfüllen, aber wenn eine
-    Dimension aus der Query aufgelöst wurde, MUSS das Item sie erfüllen
-    (kein "Fallback auf alles", solange wir ein Wort kennen)."""
+    """Harter Python-Filter über den Item-Cache.
+
+    WICHTIG (Fix ggü. der Vorversion): Signalquelle A (aufgelöste Semantic-
+    Tags) hat Vorrang vor Signalquelle B (Text-Tokens). Hat ein Item bereits
+    eine bekannte Klassifizierung für eine Dimension, wird NUR diese geprüft
+    -- der Text-Fallback greift ausschließlich für Items OHNE jede
+    Klassifizierung. Sonst würde ein Item, das korrekt als 'Speaker'
+    klassifiziert ist, trotzdem durchrutschen, nur weil sein Name zufällig
+    auch noch "licht" als Teilstring enthält.
+    """
 
     def matches_device(it: Dict[str, Any]) -> bool:
         if not device_tags:
             return True
-        if it.get("equipment_tag") in device_tags or it.get("property_tag") in device_tags:
-            return True
+        has_semantic = bool(it.get("equipment_tag") or it.get("property_tag"))
+        if has_semantic:
+            return it.get("equipment_tag") in device_tags or it.get("property_tag") in device_tags
         words = set()
         for tag in device_tags:
             words |= DEVICE_SYNONYMS.get(tag, set())
-        return any(w and w in it.get("match_text", "") for w in words)
+        return _token_hits(it.get("match_tokens", ""), words)
 
     def matches_location(it: Dict[str, Any]) -> bool:
         if not location_tags:
             return True
-        if it.get("location_tag") in location_tags:
-            return True
+        has_semantic = bool(it.get("location_tag"))
+        if has_semantic:
+            return it.get("location_tag") in location_tags
         words = set()
         for tag in location_tags:
             words |= LOCATION_SYNONYMS.get(tag, set())
-        return any(w and w in it.get("match_text", "") for w in words)
+        return _token_hits(it.get("match_tokens", ""), words)
 
     candidates = [it for it in ITEM_CACHE if matches_device(it) and matches_location(it)]
+    candidates = narrow_by_type(candidates, action)
+    return candidates
 
-    # Weitere Einengung über den erwarteten Item-Typ, falls die Aktion das hergibt.
-    if action in ("ON", "OFF") and len(candidates) > 1:
-        typed = [it for it in candidates if it.get("type") in ACTIONABLE_TYPES_ON_OFF]
+
+def narrow_by_type(candidates: List[Dict[str, Any]], action: Optional[str]) -> List[Dict[str, Any]]:
+    """Blendet reine Hilfs-Punkte aus (Transition-Zeiten, Schedule-Strings,
+    RGB-Text-Spiegel, Alarm-Modus...), die technisch zum selben Gerät gehören
+    und daher dieselben Tags/Substrings mitbringen, aber nie das sind, was
+    mit 'ist das Licht an' oder 'schalte an' gemeint ist."""
+    if len(candidates) <= 1:
+        return candidates
+
+    non_string = [c for c in candidates if c.get("type") != "String"]
+    if non_string:
+        candidates = non_string
+    if len(candidates) <= 1:
+        return candidates
+
+    if action in ("ON", "OFF"):
+        typed = [c for c in candidates if c.get("type") in ACTIONABLE_TYPES_ON_OFF]
         if typed:
             candidates = typed
+    elif action == "STATUS":
+        switches = [c for c in candidates if c.get("type") == "Switch"]
+        if switches:
+            candidates = switches
 
     return candidates
+
+
+INDEX_PATTERN_CACHE: Dict[str, re.Pattern] = {}
+
+
+def extract_item_index(tokens_str: str, words: Set[str]) -> Optional[int]:
+    """Findet eine Geräte-Nummer wie 'lampe1', 'lampe 2', 'steckdose3' als
+    eigenes Token oder Token+Zahl-Kombination. Nutzt für dasselbe Wortset
+    kompilierte Regexe wieder (Performance bei 47.780 Items)."""
+    key = "|".join(sorted(words))
+    pattern = INDEX_PATTERN_CACHE.get(key)
+    if pattern is None:
+        alts = "|".join(re.escape(w) for w in words if w)
+        if not alts:
+            return None
+        pattern = re.compile(rf"\b(?:{alts})[_ ]?(\d+)\b")
+        INDEX_PATTERN_CACHE[key] = pattern
+    m = pattern.search(tokens_str)
+    return int(m.group(1)) if m else None
+
+
+def narrow_by_index(candidates: List[Dict[str, Any]], normalized_query: str, device_tags: Set[str]) -> List[Dict[str, Any]]:
+    """Unterscheidet z.B. 'iBad_Hue_Lampen_Schalter' (ALLE Lampen im Raum)
+    von 'iBad_Hue_Lampe1_Schalter' (EINE bestimmte Lampe):
+    - Nennt die Anfrage eine Nummer ("Lampe 2", "Lampe2") -> nur Items mit
+      genau dieser Nummer im Namen behalten.
+    - Nennt die Anfrage KEINE Nummer -> das kollektive (nicht-nummerierte)
+      Item bevorzugen, wenn eines existiert (das ist die naheliegendste
+      Deutung von 'das Licht im Bad einschalten')."""
+    if len(candidates) <= 1 or not device_tags:
+        return candidates
+
+    words: Set[str] = set()
+    for tag in device_tags:
+        words |= DEVICE_SYNONYMS.get(tag, set())
+    if not words:
+        return candidates
+
+    query_index = extract_item_index(normalized_query, words)
+
+    if query_index is not None:
+        narrowed = [c for c in candidates if extract_item_index(c.get("match_tokens", ""), words) == query_index]
+        return narrowed or candidates
+
+    collective = [c for c in candidates if extract_item_index(c.get("match_tokens", ""), words) is None]
+    return collective or candidates
 
 
 # =====================================================================
@@ -724,6 +847,18 @@ def resolve_single_query(user_query: str, last_item_hint: Optional[str]) -> str:
     if not ITEM_CACHE:
         return "Die Item-Datenbank ist leer. Bitte zuerst /api/sync ausführen."
 
+    # KERN-FIX: Wenn wir WIRKLICH kein Raum-/Gerätewort kennen, NIEMALS
+    # filter_candidates() mit zwei leeren Mengen aufrufen -- das würde (per
+    # Definition "kein Filter gesetzt = alles passt") den KOMPLETTEN
+    # 47.780-Item-Bestand als "Kandidaten" zurückgeben, wovon dann nur die
+    # ersten paar (in Cache-Reihenfolge bzw. zufälligem Ranking) als
+    # "mehrdeutig" angezeigt würden -- genau der Bug, den du gesehen hast.
+    if not device_tags and not location_tags:
+        candidates = free_vector_fallback(normalized_query, n=3)
+        if not candidates:
+            return "Ich konnte kein passendes Gerät finden. Nenne mir gerne Gerätetyp und/oder Raum genauer."
+        return execute_resolved(candidates[0]["name"], candidates[0], query_lower, user_query)
+
     candidates = filter_candidates(device_tags, location_tags, action)
 
     if not candidates:
@@ -737,23 +872,22 @@ def resolve_single_query(user_query: str, last_item_hint: Optional[str]) -> str:
             candidates = filter_candidates(device_tags, set(), action)
 
     if not candidates:
-        if not device_tags and not location_tags:
-            # Wir kennen wirklich kein Wort aus der Anfrage -> letzter Ausweg:
-            # eng begrenzte freie Vektorsuche (klein halten, s.o.), NICHT
-            # über rank_candidates() mit dem kompletten Bestand.
-            candidates = free_vector_fallback(normalized_query, n=3)
-            if not candidates:
-                return "Ich konnte kein passendes Gerät finden. Nenne mir gerne Gerätetyp und/oder Raum genauer."
-        else:
-            return "Ich konnte kein Gerät finden, das zu Raum/Gerätetyp deiner Anfrage passt. Prüfe ggf. mit /api/tags, ob dieser Raum/Gerätetyp bekannt ist."
-    else:
-        candidates = rank_candidates(normalized_query, candidates)
+        return "Ich konnte kein Gerät finden, das zu Raum/Gerätetyp deiner Anfrage passt. Prüfe ggf. mit /api/tags, ob dieser Raum/Gerätetyp bekannt ist."
+
+    # "Welche Lampen/Geräte gibt es im Bad?" -> Aufzählung statt Einzelauswahl.
+    if action == "LIST":
+        return build_list_response(candidates)
+
+    # Kollektiv- vs. Einzel-Gerät unterscheiden (z.B. 'iBad_Hue_Lampen_Schalter'
+    # = alle Lampen vs. 'iBad_Hue_Lampe1_Schalter' = eine bestimmte Lampe).
+    candidates = narrow_by_index(candidates, normalized_query, device_tags)
+
+    candidates = rank_candidates(normalized_query, candidates)
 
     if len(candidates) > 1:
         top, second = candidates[0], candidates[1]
-        # Echte Mehrdeutigkeit nur, wenn wir NICHT bereits über harte Tag-
-        # Filter auf einen eindeutigen Spitzenreiter kommen konnten und die
-        # Kandidaten sich nicht schon über den Item-Typ unterscheiden.
+        # Echte Mehrdeutigkeit nur, wenn sich die Kandidaten nicht schon
+        # über den Item-Typ unterscheiden.
         if top.get("type") == second.get("type"):
             options = ", ".join(
                 f"`{c['name']}`" + (f" ({c['label']})" if c["label"] != c["name"] else "")
@@ -763,6 +897,34 @@ def resolve_single_query(user_query: str, last_item_hint: Optional[str]) -> str:
 
     best_item_meta = candidates[0]
     return execute_resolved(best_item_meta["name"], best_item_meta, query_lower, user_query)
+
+
+def build_list_response(candidates: List[Dict[str, Any]]) -> str:
+    """Aufzählung für 'Welche Lampen/Geräte/Items gibt es im Bad?'. Bevorzugt
+    Gruppen-Items (repräsentieren ein ganzes Gerät wie 'Lampe1') und
+    steuerbare Punkte; blendet reine String-Hilfspunkte aus, wenn genug
+    andere Kandidaten da sind."""
+    groups = [c for c in candidates if c.get("type") == "Group"]
+    controllable = [c for c in candidates if c.get("type") in ("Switch", "Dimmer", "Color", "Rollershutter", "Number", "Contact")]
+    shown = groups + [c for c in controllable if c not in groups]
+    if not shown:
+        shown = candidates
+
+    seen: Set[str] = set()
+    lines = []
+    for c in shown:
+        if c["name"] in seen:
+            continue
+        seen.add(c["name"])
+        label_part = f" ({c['label']})" if c["label"] != c["name"] else ""
+        lines.append(f"• `{c['name']}`{label_part}")
+        if len(lines) >= 25:
+            lines.append("… weitere vorhanden, bitte genauer eingrenzen (z.B. Raum oder Gerätetyp).")
+            break
+
+    if not lines:
+        return "Ich konnte dazu keine Geräte finden."
+    return "Gefundene Geräte:\n" + "\n".join(lines)
 
 
 def execute_resolved(best_item_name: str, best_item_meta: Dict[str, Any], query_lower: str, user_query: str) -> str:
