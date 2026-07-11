@@ -2,7 +2,7 @@ import os
 import re
 import uuid
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 import requests
 import yaml
@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import chromadb
 from chromadb.utils import embedding_functions
-from rapidfuzz import process, fuzz
+from rapidfuzz import fuzz
 
 # =====================================================================
 # 0. KONFIGURATION (.env statt Klartext-Credentials im Code)
@@ -30,7 +30,7 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("oh-ai-bridge")
 
-app = FastAPI(title="openHAB Semantic Hybrid Bridge v4")
+app = FastAPI(title="openHAB Semantic Hybrid Bridge v5")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,6 +45,17 @@ emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMB
 collection = chroma_client.get_or_create_collection(name="openhab_items", embedding_function=emb_fn)
 
 HEADERS_JSON = {"Authorization": f"Bearer {OPENHAB_TOKEN}", "Accept": "application/json"}
+
+
+# --- HELFER: UMLAUT-BEREINIGUNG ---
+def normalize_text(text: str) -> str:
+    """ Konvertiert deutsche Umlaute in ASCII-Schreibweise (ä -> ae, etc.) """
+    text = (text or "").lower().strip()
+    replacements = {'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss'}
+    for umlaut, rep in replacements.items():
+        text = text.replace(umlaut, rep)
+    return text
+
 
 # =====================================================================
 # 1. SYNONYM-KONFIGURATION LADEN (admin-pflegbar, siehe synonyms.yaml)
@@ -66,75 +77,67 @@ def load_synonym_config() -> Dict[str, Any]:
 SYN_CONFIG = load_synonym_config()
 FUZZY_MIN_SCORE = SYN_CONFIG.get("fuzzy", {}).get("min_score", 82)
 
-# Wird beim Sync mit den LIVE-Synonymen aus openHAB /rest/tags gemerged.
-# Struktur nach Merge: {"Lightbulb": {"licht", "lampe", ...}, ...}
-EQUIPMENT_SYNONYMS: Dict[str, set] = {}
-LOCATION_SYNONYMS: Dict[str, set] = {}
+# Kanonischer Tag-Name -> Set von Wörtern (z.B. "Lightbulb" -> {"licht","lampe",...})
+# Enthält NACH dem Sync sowohl Equipment- als auch Property-Tags (siehe unten,
+# Grund: viele reale Setups taggen nur den Point mit einer Property wie "Light",
+# ohne ein separates Equipment "Lightbulb" zu modellieren -- dein
+# iKueche_Hue_Lampen_Schalter ist genau so ein Fall).
+DEVICE_SYNONYMS: Dict[str, Set[str]] = {}
+LOCATION_SYNONYMS: Dict[str, Set[str]] = {}
 
-# Umgekehrte Nachschlage-Tabellen fürs Fuzzy-Matching: Wort -> (kind, tag)
-VOCAB_EQUIPMENT: Dict[str, str] = {}
-VOCAB_LOCATION: Dict[str, str] = {}
 
-
-def _merge_synonym_dict(base_cfg: Dict[str, List[str]], target: Dict[str, set]):
+def _merge_synonym_dict(base_cfg: Dict[str, List[str]], target: Dict[str, Set[str]]):
     for tag, words in base_cfg.items():
         target.setdefault(tag, set())
         for w in words:
             target[tag].add(normalize_text(w))
 
 
-def rebuild_vocab():
-    """Baut die Flat-Vokabular-Tabellen für exakte + Fuzzy-Suche neu auf."""
-    VOCAB_EQUIPMENT.clear()
-    VOCAB_LOCATION.clear()
-    for tag, words in EQUIPMENT_SYNONYMS.items():
-        for w in words:
-            VOCAB_EQUIPMENT[w] = tag
-    for tag, words in LOCATION_SYNONYMS.items():
-        for w in words:
-            VOCAB_LOCATION[w] = tag
+# --- ACTION-SYNONYME (rein YAML, kein Teil des openHAB Semantic Models) ---
+ACTION_WORDS: Dict[str, Set[str]] = {}
 
 
-# --- HELFER: UMLAUT-BEREINIGUNG (unverändert aus v3, bewährt) ---
-def normalize_text(text: str) -> str:
-    """ Konvertiert deutsche Umlaute in ASCII-Schreibweise (ä -> ae, etc.) """
-    text = text.lower().strip()
-    replacements = {'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss'}
-    for umlaut, rep in replacements.items():
-        text = text.replace(umlaut, rep)
-    return text
+def build_action_table():
+    ACTION_WORDS.clear()
+    for action, words in SYN_CONFIG.get("actions", {}).items():
+        ACTION_WORDS[action] = {normalize_text(w) for w in words}
+
+
+build_action_table()
 
 
 # =====================================================================
-# 2. OPENHAB SEMANTIC MODEL (dasselbe Modell wie HABot)
+# 2. OPENHAB SEMANTIC MODEL (dieselbe Quelle wie HABot)
 # =====================================================================
-# openHAB >= 4.0 stellt unter /rest/tags die vollständige Tag-Hierarchie
-# (Location/Equipment/Point/Property) inkl. lokalisierter Synonyme bereit
-# -- exakt die Quelle, die HABot selbst zur NLU-Auflösung nutzt.
-# Wir laden sie live, statt (wie in v3) Räume/Gerätetypen hart im Code zu
-# verdrahten. Schlägt der Request fehl (ältere openHAB-Version, Endpoint
-# deaktiviert), fallen wir sauber auf die YAML-Konfiguration zurück.
+# Zwei unabhängige Signalquellen, die wir BEIDE nutzen (nicht nur eine!),
+# weil reale openHAB-Installationen selten vollständig durchmodelliert sind:
 #
-# HINWEIS: Das exakte JSON-Schema von /rest/tags kann sich je nach
-# openHAB-Version leicht unterscheiden (z.B. Feldname "uid" vs "name",
-# "parentTag" vs "parent"). Der Parser unten ist daher defensiv und
-# probiert mehrere gängige Feldnamen. Bitte einmal gegen /api/tags
-# (Debug-Endpoint dieser Bridge) prüfen, ob die Zuordnung für dein
-# System stimmt, und ggf. die Feldnamen unten anpassen.
+#   A) Die "semantics"-Metadata pro Item (value="Point_Control",
+#      config.relatesTo="Property_Light", config.isPointOf="gKueche_Lampen").
+#      Das ist exakt das, was openHAB selbst berechnet -- zuverlässiger als
+#      reine Tag-Namen, aber nur vorhanden wenn ?metadata=... angefragt wird.
+#   B) Der reine Text (Name/Label/Gruppen-Namen) des Items, z.B.
+#      "iKueche_Hue_Lampen_Schalter" enthält "kueche" und "lampen" wörtlich.
+#      Das ist die übliche openHAB-Namenskonvention und ein sehr robustes,
+#      von der Modellierungs-Vollständigkeit unabhängiges Signal.
+#
+# Wenn (A) nichts liefert, greift (B). Wenn beide nichts liefern, ist das
+# ein echtes "ich kenne dieses Wort nicht"-Fall -- dann (und nur dann) darf
+# auf die freie Vektorsuche zurückgefallen werden.
 
 _TAG_PARENT: Dict[str, Optional[str]] = {}
 _TAG_SYNONYMS_DE: Dict[str, List[str]] = {}
 _TAG_CATEGORY_CACHE: Dict[str, Optional[str]] = {}
-
 ROOT_CATEGORIES = {"Location", "Equipment", "Point", "Property"}
 
 
 def fetch_openhab_tag_registry() -> bool:
-    """Lädt /rest/tags (deutsche Synonyme via Accept-Language) und baut
-    die Parent-Hierarchie auf. Gibt True zurück bei Erfolg."""
-    global _TAG_PARENT, _TAG_SYNONYMS_DE
+    """Lädt /rest/tags (deutsche Synonyme via Accept-Language). Nur genutzt
+    um rohe Item-Tags (Fallback B ohne semantics-Metadata) zu kategorisieren."""
+    global _TAG_PARENT, _TAG_SYNONYMS_DE, _TAG_CATEGORY_CACHE
     _TAG_PARENT = {}
     _TAG_SYNONYMS_DE = {}
+    _TAG_CATEGORY_CACHE = {}
     try:
         headers = dict(HEADERS_JSON)
         headers["Accept-Language"] = "de"
@@ -152,15 +155,13 @@ def fetch_openhab_tag_registry() -> bool:
             if isinstance(synonyms_raw, str):
                 syns = [s.strip() for s in synonyms_raw.split(",") if s.strip()]
             elif isinstance(synonyms_raw, list):
-                syns = synonyms_raw
+                syns = list(synonyms_raw)
             else:
                 syns = []
             label = t.get("label")
             if label:
                 syns.append(label)
-            # Der kurze Tag-Name (letztes Segment nach "_") ist selbst auch ein Wort
-            short = uid.split("_")[-1]
-            syns.append(short)
+            syns.append(uid.split("_")[-1])
             _TAG_PARENT[uid] = parent
             _TAG_SYNONYMS_DE[uid] = syns
         log.info(f"[SEMANTIC] {len(tags)} Tags von {OPENHAB_URL}/rest/tags geladen.")
@@ -189,85 +190,53 @@ def tag_category(uid: Optional[str]) -> Optional[str]:
 
 
 def build_synonym_tables_from_openhab():
-    """Übersetzt die geladene Tag-Hierarchie in unsere EQUIPMENT_/LOCATION_
-    SYNONYMS-Tabellen und merged sie mit der YAML-Fallback-Konfiguration."""
-    global EQUIPMENT_SYNONYMS, LOCATION_SYNONYMS
-    EQUIPMENT_SYNONYMS = {}
+    """Baut DEVICE_SYNONYMS (Equipment UND Property!) und LOCATION_SYNONYMS
+    aus der geladenen Tag-Hierarchie, merged mit der YAML-Fallback-Konfiguration."""
+    global DEVICE_SYNONYMS, LOCATION_SYNONYMS
+    DEVICE_SYNONYMS = {}
     LOCATION_SYNONYMS = {}
 
     for uid, syns in _TAG_SYNONYMS_DE.items():
         cat = tag_category(uid)
         short = uid.split("_")[-1]
         words = {normalize_text(s) for s in syns if s}
-        if cat == "Equipment":
-            EQUIPMENT_SYNONYMS.setdefault(short, set()).update(words)
+        if cat in ("Equipment", "Property"):
+            DEVICE_SYNONYMS.setdefault(short, set()).update(words)
         elif cat == "Location":
             LOCATION_SYNONYMS.setdefault(short, set()).update(words)
 
-    # Merge mit YAML (eigene Ergänzungen / Fallback wenn openHAB nichts lieferte)
-    _merge_synonym_dict(SYN_CONFIG.get("equipment", {}), EQUIPMENT_SYNONYMS)
+    _merge_synonym_dict(SYN_CONFIG.get("equipment", {}), DEVICE_SYNONYMS)
     _merge_synonym_dict(SYN_CONFIG.get("location", {}), LOCATION_SYNONYMS)
 
-    rebuild_vocab()
-    log.info(f"[SEMANTIC] {len(EQUIPMENT_SYNONYMS)} Equipment-Klassen, "
-              f"{len(LOCATION_SYNONYMS)} Location-Klassen im Vokabular.")
+    log.info(f"[SEMANTIC] {len(DEVICE_SYNONYMS)} Geräte-/Property-Klassen, "
+             f"{len(LOCATION_SYNONYMS)} Location-Klassen im Vokabular.")
 
 
-# --- ACTION-SYNONYME (rein YAML, kein Teil des openHAB Semantic Models) ---
-ACTION_WORDS: Dict[str, set] = {}
-
-
-def build_action_table():
-    ACTION_WORDS.clear()
-    for action, words in SYN_CONFIG.get("actions", {}).items():
-        ACTION_WORDS[action] = {normalize_text(w) for w in words}
-
-
-build_action_table()
-
-
-# =====================================================================
-# 3. FUZZY-MATCHING (Tippfehler-Toleranz, s. "Fuzzy Matching"-Kapitel)
-# =====================================================================
-def fuzzy_lookup(word: str, vocab: Dict[str, str]) -> Optional[str]:
-    """Exakter Treffer zuerst, sonst RapidFuzz-Korrektur (z.B. 'lich' -> 'licht')."""
-    if word in vocab:
-        return vocab[word]
-    if not vocab:
-        return None
-    match = process.extractOne(word, vocab.keys(), scorer=fuzz.WRatio, score_cutoff=FUZZY_MIN_SCORE)
-    if match:
-        return vocab[match[0]]
-    return None
-
-
-def resolve_equipment(normalized_query: str) -> Optional[str]:
-    # 1) Mehrwort-Synonyme zuerst (Substring-Check, längste zuerst = spezifischer)
-    for word, tag in sorted(VOCAB_EQUIPMENT.items(), key=lambda x: -len(x[0])):
-        if word and word in normalized_query:
-            return tag
-    # 2) Fuzzy je Token (fängt Tippfehler wie "lich" statt "licht" ab)
-    for token in normalized_query.split():
-        tag = fuzzy_lookup(token, VOCAB_EQUIPMENT)
-        if tag:
-            return tag
-    return None
-
-
-def resolve_location(normalized_query: str) -> Optional[str]:
-    for word, tag in sorted(VOCAB_LOCATION.items(), key=lambda x: -len(x[0])):
-        if word and word in normalized_query:
-            return tag
-    for token in normalized_query.split():
-        tag = fuzzy_lookup(token, VOCAB_LOCATION)
-        if tag:
-            return tag
-    return None
+def resolve_tags(normalized_query: str, synonym_table: Dict[str, Set[str]]) -> Set[str]:
+    """Gibt ALLE kanonischen Tags zurück, deren Synonym-Wort in der Anfrage
+    vorkommt (Substring ODER Fuzzy je Token). Bewusst eine MENGE statt eines
+    einzelnen Tags: 'licht' kann z.B. sowohl als Equipment 'Lightbulb' als
+    auch als Property 'Light' modelliert sein -- beide sollen zählen."""
+    matched: Set[str] = set()
+    tokens = normalized_query.split()
+    for tag, words in synonym_table.items():
+        for w in words:
+            if not w:
+                continue
+            if w in normalized_query:
+                matched.add(tag)
+                break
+            for token in tokens:
+                if len(token) >= 3 and fuzz.WRatio(token, w) >= FUZZY_MIN_SCORE:
+                    matched.add(tag)
+                    break
+            else:
+                continue
+            break
+    return matched
 
 
 def resolve_action(query_lower: str) -> Optional[str]:
-    """Reihenfolge wichtig: Fragen ('wie', 'ist') schlagen reine An/Aus-Worte,
-    damit 'ist das Licht an?' als STATUS statt als ON erkannt wird."""
     if query_lower.strip().startswith(("sind ", "ist ", "hat ", "läuft ", "laeuft ", "gibt ")):
         return "STATUS"
     for action in ["STATUS", "OFF", "ON", "UP", "DOWN"]:
@@ -278,7 +247,7 @@ def resolve_action(query_lower: str) -> Optional[str]:
 
 
 # =====================================================================
-# 4. REQUEST-MODELLE (OpenAI-kompatibel)
+# 3. REQUEST-MODELLE (OpenAI-kompatibel)
 # =====================================================================
 class ChatMessage(BaseModel):
     role: str
@@ -292,64 +261,116 @@ class ChatCompletionRequest(BaseModel):
 
 
 # =====================================================================
-# 5. SYNC: Items von openHAB holen, semantisch klassifizieren, in Chroma
+# 4. SEMANTISCHE KLASSIFIZIERUNG EINES ITEMS
 # =====================================================================
-def _collect_item_tags(item: dict, items_by_name: Dict[str, dict]) -> List[str]:
-    """Sammelt Tags des Items selbst + aller Ancestor-Gruppen (wie HABot:
-    'Checks ancestor groups one level at a time'), ohne zusätzliche
-    REST-Calls, da /rest/items bereits tags + groupNames aller Items liefert."""
-    collected = list(item.get("tags", []))
+def _classify_value(value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    if not value or "_" not in value:
+        return None, None
+    cat, _, tag = value.partition("_")
+    return cat, tag
+
+
+def resolve_item_semantics(item: dict, items_by_name: Dict[str, dict], max_depth: int = 4) -> Dict[str, Optional[str]]:
+    """Ermittelt location_tag / equipment_tag / property_tag für ein Item.
+
+    Quelle A (bevorzugt): die 'semantics'-Metadata (value + config.relatesTo /
+    isPointOf / isPartOf), also exakt das, was openHAB selbst berechnet.
+    Läuft dazu die isPointOf/isPartOf-Kette nach oben (Point -> Equipment ->
+    Location), analog zu HABots eigener Auflösung ('checks ancestor groups
+    one level at a time').
+
+    Quelle B (Fallback je Ebene): rohe Tags + /rest/tags-Kategorisierung,
+    für Items/Gruppen ohne semantics-Metadata.
+    """
+    location_tag = equipment_tag = property_tag = None
     visited = set()
-    frontier = list(item.get("groupNames", []))
-    while frontier:
-        gname = frontier.pop()
-        if gname in visited:
-            continue
-        visited.add(gname)
-        group = items_by_name.get(gname)
-        if not group:
-            continue
-        collected.extend(group.get("tags", []))
-        frontier.extend(group.get("groupNames", []))
-    return collected
+    current = item
+    depth = 0
+
+    while current and depth < max_depth:
+        depth += 1
+        name = current.get("name")
+        if not name or name in visited:
+            break
+        visited.add(name)
+
+        meta = current.get("metadata", {}) or {}
+        sem = meta.get("semantics")
+
+        if sem:
+            cat, tag = _classify_value(sem.get("value"))
+            if cat == "Location" and not location_tag:
+                location_tag = tag
+            elif cat == "Equipment" and not equipment_tag:
+                equipment_tag = tag
+            elif cat == "Property" and not property_tag:
+                property_tag = tag
+
+            config = sem.get("config", {}) or {}
+            relates_to = config.get("relatesTo")
+            if relates_to:
+                r_cat, r_tag = _classify_value(relates_to)
+                if r_cat == "Property" and not property_tag:
+                    property_tag = r_tag
+                elif r_cat == "Equipment" and not equipment_tag:
+                    equipment_tag = r_tag
+                elif r_cat == "Location" and not location_tag:
+                    location_tag = r_tag
+
+            if location_tag and equipment_tag:
+                break
+
+            next_name = config.get("isPointOf") or config.get("isPartOf")
+            if next_name and next_name in items_by_name:
+                current = items_by_name[next_name]
+                continue
+
+        # Fallback B: rohe Tags dieses Items/dieser Gruppe
+        for t in current.get("tags", []):
+            cat = tag_category(t)
+            short = t.split("_")[-1] if "_" in t else t
+            if cat == "Location" and not location_tag:
+                location_tag = short
+            elif cat == "Equipment" and not equipment_tag:
+                equipment_tag = short
+            elif cat == "Property" and not property_tag:
+                property_tag = short
+
+        if location_tag and equipment_tag:
+            break
+
+        # eine Ebene über groupNames weiterlaufen
+        next_group = None
+        for g in current.get("groupNames", []):
+            if g not in visited and g in items_by_name:
+                next_group = g
+                break
+        if next_group:
+            current = items_by_name[next_group]
+        else:
+            break
+
+    return {"location_tag": location_tag, "equipment_tag": equipment_tag, "property_tag": property_tag}
 
 
-def classify_item_semantics(item: dict, items_by_name: Dict[str, dict]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Gibt (location_tag, equipment_tag, point_tag) zurück, aufgelöst über
-    die echte openHAB-Tag-Hierarchie (Ancestor-Walk wie bei HABot)."""
-    tags = _collect_item_tags(item, items_by_name)
-    location_tag = equipment_tag = point_tag = None
-    for t in tags:
-        cat = tag_category(t)
-        short = t.split("_")[-1] if "_" in t else t
-        if cat == "Location" and not location_tag:
-            location_tag = short
-        elif cat == "Equipment" and not equipment_tag:
-            equipment_tag = short
-        elif cat == "Point" and not point_tag:
-            point_tag = short
-        elif cat is None:
-            # Keine bekannte Kategorie (altes openHAB ohne Tag-Registry,
-            # oder Tag-Name entspricht direkt einem unserer YAML-Keys) ->
-            # gegen YAML-Synonymtabellen matchen als Fallback.
-            norm = normalize_text(t)
-            if not equipment_tag and norm in EQUIPMENT_SYNONYMS:
-                equipment_tag = t
-            if not location_tag and norm in LOCATION_SYNONYMS:
-                location_tag = t
-    return location_tag, equipment_tag, point_tag
-
-
+# =====================================================================
+# 5. SYNC: Items von openHAB holen (inkl. semantics-Metadata!) -> Chroma
+# =====================================================================
 @app.post("/api/sync")
 def sync_items_to_vector_db():
-    """ Holt alle Items von openHAB, klassifiziert sie über das Semantic
-    Model (Location/Equipment, wie HABot) und führt ein Upsert in ChromaDB durch. """
     tag_registry_ok = fetch_openhab_tag_registry()
     build_synonym_tables_from_openhab()
 
     try:
-        log.info("[SYNC] Rufe Items von openHAB ab...")
-        response = requests.get(f"{OPENHAB_URL}/rest/items", headers=HEADERS_JSON, timeout=60)
+        log.info("[SYNC] Rufe Items von openHAB ab (inkl. semantics-Metadata)...")
+        # WICHTIG: ohne ?metadata=.+ liefert /rest/items KEIN Metadata-Feld
+        # (im Unterschied zum Einzel-Item-GET, das es implizit mitliefert).
+        response = requests.get(
+            f"{OPENHAB_URL}/rest/items",
+            headers=HEADERS_JSON,
+            params={"metadata": ".+"},
+            timeout=60,
+        )
         response.raise_for_status()
         items = response.json()
     except Exception as e:
@@ -358,7 +379,7 @@ def sync_items_to_vector_db():
     items_by_name = {i["name"]: i for i in items}
 
     ids, documents, metadatas = [], [], []
-    log.info(f"[SYNC] Analysiere {len(items)} Items (Semantic Model: {'live' if tag_registry_ok else 'YAML-Fallback'})...")
+    log.info(f"[SYNC] Analysiere {len(items)} Items (Tag-Registry: {'live' if tag_registry_ok else 'YAML-Fallback'})...")
 
     for item in items:
         name = item.get("name", "")
@@ -367,12 +388,12 @@ def sync_items_to_vector_db():
         tags = item.get("tags", [])
         group_names = item.get("groupNames", [])
 
-        location_tag, equipment_tag, point_tag = classify_item_semantics(item, items_by_name)
+        sem = resolve_item_semantics(item, items_by_name)
 
-        # openbrain-Metadaten weiterhin unterstützen (Altbestand aus v3)
         openbrain_hint = openbrain_role = ""
-        if "metadata" in item and "openbrain" in item["metadata"]:
-            ob = item["metadata"]["openbrain"].get("value", "")
+        meta = item.get("metadata", {}) or {}
+        if "openbrain" in meta:
+            ob = meta["openbrain"].get("value", "")
             hint_match = re.search(r'hint=([^,]+)', ob)
             role_match = re.search(r'role=([^,]+)', ob)
             if hint_match:
@@ -386,14 +407,21 @@ def sync_items_to_vector_db():
             f"item: {label.lower()}. name: {name.lower()}. typ: {type_.lower()}. "
             f"tags: {tags_str.lower()}. gruppen: {groups_str.lower()}."
         )
-        if location_tag:
-            semantic_text += f" raum: {location_tag.lower()}."
-        if equipment_tag:
-            semantic_text += f" geraetetyp: {equipment_tag.lower()}."
+        if sem["location_tag"]:
+            semantic_text += f" raum: {sem['location_tag'].lower()}."
+        if sem["equipment_tag"]:
+            semantic_text += f" geraetetyp: {sem['equipment_tag'].lower()}."
+        if sem["property_tag"]:
+            semantic_text += f" eigenschaft: {sem['property_tag'].lower()}."
         if openbrain_hint:
             semantic_text += f" info: {openbrain_hint.lower()}."
         if openbrain_role:
             semantic_text += f" rolle: {openbrain_role.lower()}."
+
+        # match_text: normalisierter Volltext für den harten Substring-Filter
+        # (Signalquelle B) -- unabhängig davon, ob die semantische
+        # Klassifizierung (Signalquelle A) funktioniert hat.
+        match_text = normalize_text(f"{name} {label} {tags_str} {groups_str}")
 
         ids.append(name)
         documents.append(semantic_text)
@@ -401,9 +429,10 @@ def sync_items_to_vector_db():
             "name": name,
             "type": type_,
             "label": label,
-            "location_tag": location_tag or "",
-            "equipment_tag": equipment_tag or "",
-            "point_tag": point_tag or "",
+            "location_tag": sem["location_tag"] or "",
+            "equipment_tag": sem["equipment_tag"] or "",
+            "property_tag": sem["property_tag"] or "",
+            "match_text": match_text,
         })
 
     batch_size = 5000
@@ -415,30 +444,43 @@ def sync_items_to_vector_db():
             metadatas=metadatas[i:i + batch_size],
         )
 
-    classified = sum(1 for m in metadatas if m["location_tag"] or m["equipment_tag"])
+    rebuild_item_cache()
+    classified = sum(1 for m in metadatas if m["location_tag"] or m["equipment_tag"] or m["property_tag"])
     log.info("[SYNC] Synchronisierung abgeschlossen.")
     return {
         "status": "success",
         "message": f"{len(ids)} Items synchronisiert.",
-        "semantic_model_source": "openhab_live" if tag_registry_ok else "yaml_fallback",
+        "tag_registry_source": "openhab_live" if tag_registry_ok else "yaml_fallback",
         "items_with_semantic_classification": classified,
+        "items_total": len(ids),
     }
 
 
 @app.get("/api/tags")
 def debug_tag_registry():
-    """Debug-Endpoint: zeigt, wie die Bridge deine openHAB-Tags interpretiert
-    hat, damit du Feldnamen-Abweichungen (siehe Kommentar oben) erkennen kannst."""
     return {
-        "equipment_classes": {k: sorted(v) for k, v in EQUIPMENT_SYNONYMS.items()},
+        "device_classes": {k: sorted(v) for k, v in DEVICE_SYNONYMS.items()},
         "location_classes": {k: sorted(v) for k, v in LOCATION_SYNONYMS.items()},
         "raw_tag_count": len(_TAG_PARENT),
     }
 
 
+@app.get("/api/items/{item_name}")
+def debug_item(item_name: str):
+    """Zeigt, wie die Bridge ein konkretes Item klassifiziert hat -- zum
+    Nachvollziehen, z.B. curl http://127.0.0.1:8000/api/items/iKueche_Hue_Lampen_Schalter"""
+    try:
+        result = collection.get(ids=[item_name])
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not result or not result.get("ids"):
+        raise HTTPException(status_code=404, detail="Item nicht in der Vektordatenbank. Erst /api/sync ausführen.")
+    return {"metadata": result["metadatas"][0], "document": result["documents"][0]}
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "items_cached": len(ITEM_CACHE)}
 
 
 # =====================================================================
@@ -457,48 +499,107 @@ def get_openhab_state(item_name: str) -> str:
 
 
 # =====================================================================
-# 7. KONTEXT-GEDÄCHTNIS AUS DER CONVERSATION (statt globaler Variable)
+# 7. IN-MEMORY ITEM-CACHE (deterministische Python-Filterung statt
+#    Chroma-`where`-Klauseln -- klein, schnell, leicht nachvollziehbar für
+#    die typische Item-Anzahl einer Smart-Home-Installation)
 # =====================================================================
-# v3 hielt das "zuletzt verwendete Item" in einer globalen Python-Variable.
-# Das bricht bei mehreren gleichzeitigen Nutzern/Chats (Open WebUI kann
-# mehrere Unterhaltungen parallel bedienen -> ein globaler Zustand würde
-# zwischen fremden Chats "durchsickern"). Open WebUI schickt im OpenAI-
-# Format aber ohnehin die komplette bisherige Unterhaltung mit -> wir lesen
-# das zuletzt verwendete Item direkt aus request.messages, statt es global
-# zu speichern. Damit ist die Bridge zustandslos und pro Chat korrekt.
+ITEM_CACHE: List[Dict[str, Any]] = []
+ITEM_NAMES: Set[str] = set()
+
+
+def rebuild_item_cache():
+    global ITEM_CACHE, ITEM_NAMES
+    try:
+        data = collection.get(include=["metadatas"])
+        ITEM_CACHE = [dict(m, id=i) for i, m in zip(data["ids"], data["metadatas"])]
+        ITEM_NAMES = {m["name"] for m in ITEM_CACHE}
+        log.info(f"[CACHE] {len(ITEM_CACHE)} Items im Speicher-Cache.")
+    except Exception as e:
+        log.warning(f"[CACHE] Konnte Item-Cache nicht laden ({e}). Erst /api/sync ausführen.")
+        ITEM_CACHE = []
+        ITEM_NAMES = set()
+
+
+ACTIONABLE_TYPES_ON_OFF = {"Switch", "Dimmer", "Color", "Rollershutter"}
+
+
+def filter_candidates(
+    device_tags: Set[str],
+    location_tags: Set[str],
+    action: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Harter Python-Filter über den Item-Cache. Beide Signalquellen (A:
+    aufgelöste Tags, B: Substring im match_text) zählen unabhängig
+    voneinander -- ein Item muss NUR eine davon erfüllen, aber wenn eine
+    Dimension aus der Query aufgelöst wurde, MUSS das Item sie erfüllen
+    (kein "Fallback auf alles", solange wir ein Wort kennen)."""
+
+    def matches_device(it: Dict[str, Any]) -> bool:
+        if not device_tags:
+            return True
+        if it.get("equipment_tag") in device_tags or it.get("property_tag") in device_tags:
+            return True
+        words = set()
+        for tag in device_tags:
+            words |= DEVICE_SYNONYMS.get(tag, set())
+        return any(w and w in it.get("match_text", "") for w in words)
+
+    def matches_location(it: Dict[str, Any]) -> bool:
+        if not location_tags:
+            return True
+        if it.get("location_tag") in location_tags:
+            return True
+        words = set()
+        for tag in location_tags:
+            words |= LOCATION_SYNONYMS.get(tag, set())
+        return any(w and w in it.get("match_text", "") for w in words)
+
+    candidates = [it for it in ITEM_CACHE if matches_device(it) and matches_location(it)]
+
+    # Weitere Einengung über den erwarteten Item-Typ, falls die Aktion das hergibt.
+    if action in ("ON", "OFF") and len(candidates) > 1:
+        typed = [it for it in candidates if it.get("type") in ACTIONABLE_TYPES_ON_OFF]
+        if typed:
+            candidates = typed
+
+    return candidates
+
+
+# =====================================================================
+# 8. KONTEXT-GEDÄCHTNIS AUS DER CONVERSATION (statt globaler Variable)
+# =====================================================================
 ITEM_REF_PATTERN = re.compile(r"`([A-Za-z0-9_]+)`")
 
 
 def find_last_used_item(messages: List[ChatMessage]) -> Optional[str]:
-    for msg in reversed(messages[:-1]):  # letzte Nachricht ist die aktuelle Anfrage
+    for msg in reversed(messages[:-1]):
         if msg.role != "assistant":
             continue
-        matches = ITEM_REF_PATTERN.findall(msg.content)
-        for candidate in matches:
-            # Wir haben Item-Namen in Backticks immer als *zweiten* Treffer
-            # ausgegeben (Label zuerst) -> einfach das letzte Backtick-Wort
-            # nehmen, das tatsächlich ein bekanntes Item ist.
-            try:
-                existing = collection.get(ids=[candidate])
-                if existing and existing.get("ids"):
-                    return candidate
-            except Exception:
-                continue
+        for candidate in ITEM_REF_PATTERN.findall(msg.content):
+            if candidate in ITEM_NAMES:
+                return candidate
+    return None
+
+
+def find_exact_item_reference(user_query: str) -> Optional[str]:
+    """Power-User-Shortcut: wird der exakte Item-Name im Text genannt
+    (z.B. 'Sende ON an iKueche_Hue_Lampen_Schalter'), diesen direkt nutzen
+    und die ganze Synonym-/Fuzzy-Pipeline überspringen."""
+    for token in re.findall(r"[A-Za-z0-9_]+", user_query):
+        if token in ITEM_NAMES:
+            return token
     return None
 
 
 def get_item_meta(item_name: str) -> Optional[Dict[str, Any]]:
-    try:
-        result = collection.get(ids=[item_name])
-        if result and result.get("ids"):
-            return result["metadatas"][0]
-    except Exception:
-        return None
+    for it in ITEM_CACHE:
+        if it["name"] == item_name:
+            return it
     return None
 
 
 # =====================================================================
-# 8. NUMERISCHE WERTE (Prozent / Grad) SAUBER PARSEN
+# 9. NUMERISCHE WERTE (Prozent / Grad) SAUBER PARSEN
 # =====================================================================
 NUMBER_PATTERN = re.compile(r"(\d+(?:[.,]\d+)?)\s*(%|prozent|grad|°c?|°)?")
 
@@ -508,91 +609,112 @@ def extract_numeric_command(user_query: str) -> Optional[str]:
     if not match:
         return None
     value = match.group(1).replace(",", ".")
-    # openHAB erwartet für Setpoints/Dimmer i.d.R. reine Zahlen ohne Einheit
     if value.endswith(".0"):
         value = value[:-2]
     return value
 
 
 # =====================================================================
-# 9. HYBRIDE SUCHE: Tag-Filter (präzise) + Vektorsuche (unscharf) kombiniert
+# 10. RANKING INNERHALB DER KANDIDATEN (Embeddings nur als Tiebreaker,
+#     NIEMALS mehr als Fallback über den gesamten unfiltierten Bestand,
+#     solange mindestens eine Dimension aus der Query aufgelöst wurde)
 # =====================================================================
-def query_candidates(normalized_query: str, equipment_tag: Optional[str], location_tag: Optional[str], n_results: int = 5):
-    """Progressive Filterung: erst beide Tags, dann einzeln, dann frei.
-    Das ist der Kern der Optimierung: statt reiner Textsuche wird zuerst
-    über das Semantic Model präzise vorgefiltert (viel weniger Verwechslungen
-    zwischen z.B. zwei Lampen in unterschiedlichen Räumen), die Vektorsuche
-    rankt danach nur noch innerhalb der (kleinen) Kandidatenmenge."""
-    attempts = []
-    if equipment_tag and location_tag:
-        attempts.append({"$and": [{"equipment_tag": equipment_tag}, {"location_tag": location_tag}]})
-    if equipment_tag:
-        attempts.append({"equipment_tag": equipment_tag})
-    if location_tag:
-        attempts.append({"location_tag": location_tag})
-    attempts.append(None)  # letzter Versuch: ungefiltert, wie in v3
+def rank_candidates(normalized_query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if len(candidates) <= 1:
+        return candidates
+    names = [c["name"] for c in candidates]
+    try:
+        results = collection.query(query_texts=[normalized_query], n_results=len(ITEM_CACHE) or 1)
+        order = {name: idx for idx, name in enumerate(results["ids"][0])}
+        return sorted(candidates, key=lambda c: order.get(c["name"], len(order)))
+    except Exception as e:
+        log.warning(f"[RANK] Vektor-Ranking fehlgeschlagen ({e}), behalte Cache-Reihenfolge.")
+        return candidates
 
-    for where in attempts:
-        kwargs = {"query_texts": [normalized_query], "n_results": n_results}
-        if where:
-            kwargs["where"] = where
-        results = collection.query(**kwargs)
-        if results["ids"] and len(results["ids"][0]) > 0:
-            return results, where
-    return None, None
+
+CLARIFY_MAX_OPTIONS = 4
 
 
 # =====================================================================
-# 10. HAUPT-ENDPUNKT
+# 11. HAUPT-AUFLÖSUNG EINER EINZELNEN ANFRAGE
 # =====================================================================
-CLARIFY_DISTANCE_MARGIN = 0.08  # wie nah Platz 1 und 2 beieinander liegen dürfen
-
-
 def resolve_single_query(user_query: str, last_item_hint: Optional[str]) -> str:
     normalized_query = normalize_text(user_query)
     query_lower = user_query.lower()
 
-    equipment_tag = resolve_equipment(normalized_query)
-    location_tag = resolve_location(normalized_query)
+    # Power-User-Shortcut: exakter Item-Name genannt -> direkt nutzen.
+    exact_name = find_exact_item_reference(user_query)
+    if exact_name:
+        best_item_meta = get_item_meta(exact_name)
+        return execute_resolved(exact_name, best_item_meta, query_lower, user_query)
+
+    device_tags = resolve_tags(normalized_query, DEVICE_SYNONYMS)
+    location_tags = resolve_tags(normalized_query, LOCATION_SYNONYMS)
     action = resolve_action(query_lower)
 
-    is_short_followup = len(query_lower.split()) <= 4 and action and not location_tag and not equipment_tag
+    is_short_followup = len(query_lower.split()) <= 4 and action and not device_tags and not location_tags
 
     if is_short_followup and last_item_hint:
-        best_item_name = last_item_hint
-        best_item_meta = get_item_meta(best_item_name)
+        best_item_meta = get_item_meta(last_item_hint)
         if not best_item_meta:
             return "Ich konnte das zuvor verwendete Gerät nicht mehr finden. Bitte nenne Gerät oder Raum erneut."
-        log.info(f"[MIDDLEWARE] Folge-Befehl erkannt. Nutze Kontext-Item: {best_item_name}")
-    else:
-        results, used_filter = query_candidates(normalized_query, equipment_tag, location_tag)
-        if not results:
-            return "Ich konnte kein passendes Gerät finden. Nenne mir gerne Gerätetyp und/oder Raum genauer."
+        log.info(f"[MIDDLEWARE] Folge-Befehl erkannt. Nutze Kontext-Item: {last_item_hint}")
+        return execute_resolved(last_item_hint, best_item_meta, query_lower, user_query)
 
-        ids0 = results["ids"][0]
-        metas0 = results["metadatas"][0]
-        dists0 = results.get("distances", [[None]])[0]
+    if not ITEM_CACHE:
+        return "Die Item-Datenbank ist leer. Bitte zuerst /api/sync ausführen."
 
-        # Klärungsdialog bei Mehrdeutigkeit (Confidence-Score-Idee aus deinen
-        # Recherchen: statt blind zu raten, lieber kurz nachfragen -- v.a.
-        # wichtig bei ausführenden Befehlen, nicht nur bei Status-Abfragen).
-        if len(ids0) > 1 and dists0[0] is not None and dists0[1] is not None:
-            if (dists0[1] - dists0[0]) < CLARIFY_DISTANCE_MARGIN and used_filter is None:
-                options = ", ".join(f"`{m['label']}`" for m in metas0[:3])
-                return f"🤔 Das ist mehrdeutig, ich habe mehrere passende Geräte gefunden: {options}. Welches meinst du genau (Raum oder genauer Name hilft)?"
+    candidates = filter_candidates(device_tags, location_tags, action)
 
-        best_item_name = ids0[0]
-        best_item_meta = metas0[0]
+    if not candidates:
+        # Kein Item erfüllt beide Dimensionen -> eine davon lockern, statt
+        # sofort auf den kompletten unfiltierten Bestand zu springen.
+        if device_tags and location_tags:
+            candidates = filter_candidates(device_tags, set(), action)
+        if not candidates and location_tags:
+            candidates = filter_candidates(set(), location_tags, action)
+        if not candidates and device_tags:
+            candidates = filter_candidates(device_tags, set(), action)
 
+    if not candidates:
+        if not device_tags and not location_tags:
+            # Wir kennen wirklich kein Wort aus der Anfrage -> letzter Ausweg:
+            # freie Vektorsuche über den ganzen Bestand (wie in v3).
+            candidates = rank_candidates(normalized_query, list(ITEM_CACHE))[:3]
+            if not candidates:
+                return "Ich konnte kein passendes Gerät finden. Nenne mir gerne Gerätetyp und/oder Raum genauer."
+        else:
+            return "Ich konnte kein Gerät finden, das zu Raum/Gerätetyp deiner Anfrage passt. Prüfe ggf. mit /api/tags, ob dieser Raum/Gerätetyp bekannt ist."
+
+    candidates = rank_candidates(normalized_query, candidates)
+
+    if len(candidates) > 1:
+        top, second = candidates[0], candidates[1]
+        # Echte Mehrdeutigkeit nur, wenn wir NICHT bereits über harte Tag-
+        # Filter auf einen eindeutigen Spitzenreiter kommen konnten und die
+        # Kandidaten sich nicht schon über den Item-Typ unterscheiden.
+        if top.get("type") == second.get("type"):
+            options = ", ".join(
+                f"`{c['name']}`" + (f" ({c['label']})" if c["label"] != c["name"] else "")
+                for c in candidates[:CLARIFY_MAX_OPTIONS]
+            )
+            return f"🤔 Das ist mehrdeutig, ich habe mehrere passende Geräte gefunden: {options}. Sag mir gerne den genauen Namen oder ein unterscheidendes Detail."
+
+    best_item_meta = candidates[0]
+    return execute_resolved(best_item_meta["name"], best_item_meta, query_lower, user_query)
+
+
+def execute_resolved(best_item_name: str, best_item_meta: Dict[str, Any], query_lower: str, user_query: str) -> str:
     best_item_label = best_item_meta["label"]
     item_type = best_item_meta.get("type", "")
     log.info(f"[MIDDLEWARE] Gewähltes Item: {best_item_name} ({best_item_label}) [Typ: {item_type}]")
 
-    # Schutz vor Audio-/Medien-Fehltriggern bleibt als zusätzliches Netz erhalten
     if best_item_meta.get("equipment_tag") in ("Speaker", "MediaPlayer", "Television") or \
        any(w in best_item_name.lower() for w in ["audio", "medialib", "play"]):
         if not any(w in query_lower for w in ["musik", "spiel", "song", "album", "interpret", "lautstaerke", "lautstärke", "sender", "kanal"]):
             return f"⚠️ Suchkonflikt: Ich habe das Medien-Item `{best_item_name}` gefunden, deine Frage bezog sich aber vermutlich nicht auf Medien. Bitte präzisiere."
+
+    action = resolve_action(query_lower)
 
     if action == "STATUS":
         state = get_openhab_state(best_item_name)
@@ -664,10 +786,8 @@ async def list_models():
 
 @app.on_event("startup")
 def on_startup():
-    # Beim Start einmal versuchen, das Semantic Model zu laden, damit die
-    # Bridge auch ohne manuellen /api/sync-Call sofort Synonyme kennt
-    # (der Sync selbst -- also das Neu-Einlesen der Items -- bleibt separat).
     if fetch_openhab_tag_registry():
         build_synonym_tables_from_openhab()
     else:
-        build_synonym_tables_from_openhab()  # baut wenigstens aus YAML auf
+        build_synonym_tables_from_openhab()
+    rebuild_item_cache()

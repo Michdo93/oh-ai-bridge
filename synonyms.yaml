@@ -20,6 +20,12 @@
 # Bezeichnern übereinstimmen (z.B. "Lightbulb", "Bedroom"), damit das
 # Merging funktioniert. Schau bei Unsicherheit in /api/tags (Debug-
 # Endpoint der Bridge) nach, was dein System tatsächlich liefert.
+#
+# WICHTIG: Unter "equipment" dürfen sowohl echte Equipment-Tags
+# (z.B. "Lightbulb") als auch Property-Tags (z.B. "Light") stehen. Viele
+# reale Setups taggen nur den Point mit einer Property wie "Light", ohne
+# ein eigenes Equipment zu modellieren -- die Bridge behandelt beide
+# gleichwertig als "Geräteklasse".
 
 equipment:
   Lightbulb: [licht, lampe, leuchte, beleuchtung, lämpchen, deckenlampe, stehlampe, spot, strahler]

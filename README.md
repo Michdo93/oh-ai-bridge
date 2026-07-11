@@ -5,10 +5,11 @@ An ultra-fast, lightweight Python middleware designed to bridge **openHAB** with
 Version 4 adds real integration with openHAB's **Semantic Model** (the same Location/Equipment tag hierarchy HABot uses), so you're no longer limited to phrasing that matches an item's literal name — "turn on the light" now works even if the item is technically named `Bedroom_Lamp_Switch`.
 
 ## Features
-- **openHAB Semantic Model Integration:** Loads the Location/Equipment/Point tag hierarchy live from `/rest/tags` (openHAB ≥ 4.0), the same registry HABot uses. Rooms and device classes are resolved from your actual openHAB tags instead of a hardcoded keyword list.
-- **Synonym & Fuzzy Matching:** A user-editable `synonyms.yaml` extends the tags from openHAB with your own vocabulary (slang, abbreviations). RapidFuzz adds typo tolerance ("lich" → "licht") without needing an LLM.
-- **Hybrid Retrieval:** Combines precise tag-based filtering (room + device class) with vector search for ranking, instead of relying on raw text similarity alone — far fewer mix-ups between similar devices.
-- **Clarification on Ambiguity:** If two candidate devices are too close to call, the bridge asks a short follow-up question instead of guessing and triggering the wrong device.
+- **Dual-Signal Semantic Resolution:** Reads openHAB's own computed `semantics` item-metadata (`Point_Control`, `relatesTo: Property_Light`, `isPointOf: <Equipment/Location group>`) — the same data HABot uses — **and** falls back to plain substring matching on an item's name/label/groups (e.g. `iKueche_Hue_Lampen_Schalter` literally contains "kueche" and "lampen"). Either signal is enough; you're not dependent on your installation being fully/consistently tagged.
+- **Deterministic Candidate Filtering:** Instead of trusting a vector-similarity fallback whenever tag metadata is incomplete, the bridge hard-filters the actual item list in Python by room/device class first. Embeddings are only used to *rank* an already-relevant shortlist, never to search the entire, unrelated item corpus (e.g. media library entries no longer show up for a kitchen-light question).
+- **Synonym & Fuzzy Matching:** A user-editable `synonyms.yaml` extends the tags/properties from openHAB with your own vocabulary (slang, abbreviations). RapidFuzz adds typo tolerance ("lich" → "licht") without needing an LLM.
+- **Clarification on Genuine Ambiguity:** If multiple same-type devices remain after filtering, the bridge asks a short follow-up and lists the actual (unique) item **names**, not just their (often duplicated) labels.
+- **Exact-Name Shortcut:** Naming the precise openHAB item ID in the chat (e.g. *"Sende ON an iKueche_Hue_Lampen_Schalter"*) bypasses synonym/fuzzy resolution entirely and uses it directly.
 - **Context-Aware Follow-up Commands:** Simple phrases like *"Turn it off"* automatically target the last used device — resolved from the conversation history Open WebUI already sends, not from shared global state, so it stays correct across multiple concurrent chats/users.
 - **Multi-Command Support:** Requests like *"Turn on the light and the heating"* are split and handled individually.
 - **Strict Query Prioritization:** Differentiates between state checks (*"Are the lights on?"*) and actual toggle commands.
@@ -156,26 +157,33 @@ curl -X POST http://127.0.0.1:8000/api/sync
 
 *Note: This utilizes an `upsert` mechanism. You can run this command anytime your openHAB items change without breaking existing data.*
 
-During sync, the bridge also fetches your openHAB Semantic Model (`/rest/tags`) and classifies every item by walking up its group hierarchy to find the nearest Location and Equipment tag — the same resolution logic HABot uses. The response tells you whether this succeeded:
+During sync, the bridge requests `/rest/items?metadata=.+` (metadata is **not** included by default on the bulk items endpoint — only on a single-item `GET`, so this explicit request matters) and resolves, per item, its Location/Equipment/Property classification by following the `semantics` metadata's `isPointOf`/`isPartOf` chain upward — the same resolution HABot performs internally. Where that metadata is missing or incomplete, it falls back to categorizing the item's raw `tags` via `/rest/tags`, and independently, to plain substring matching against the item's own name/label/groups. The response tells you how many items ended up classified:
 
 ```json
 {
   "status": "success",
   "message": "142 Items synchronisiert.",
-  "semantic_model_source": "openhab_live",
-  "items_with_semantic_classification": 118
+  "tag_registry_source": "openhab_live",
+  "items_with_semantic_classification": 118,
+  "items_total": 142
 }
 ```
 
-If `semantic_model_source` is `yaml_fallback`, your openHAB version doesn't expose `/rest/tags` (older than 4.0, or the endpoint is disabled) — the bridge still works, falling back to the room/device synonym lists defined in `synonyms.yaml`.
+If `tag_registry_source` is `yaml_fallback`, your openHAB version doesn't expose `/rest/tags` (older than 4.0, or the endpoint is disabled) — the bridge still works, relying on the room/device synonym lists in `synonyms.yaml` plus substring matching.
 
-To see exactly how the bridge interpreted your tags (useful if room/device detection looks off), check:
+To see exactly how the bridge interpreted your tags overall, check:
 
 ```bash
 curl http://127.0.0.1:8000/api/tags
 ```
 
-A basic liveness check is available at:
+To see exactly how one specific item was classified (very useful when debugging why a query does or doesn't match, e.g. the item from your own REST inspection):
+
+```bash
+curl http://127.0.0.1:8000/api/items/iKueche_Hue_Lampen_Schalter
+```
+
+A basic liveness check (also reports how many items are currently cached in memory) is available at:
 
 ```bash
 curl http://127.0.0.1:8000/health
@@ -201,16 +209,20 @@ curl http://127.0.0.1:8000/health
 
 ## How Query Resolution Works
 
-1. The incoming message is normalized (lowercased, umlauts folded: `ä` → `ae`, etc.).
-2. **Device class** and **room** are resolved against your openHAB Semantic Model + `synonyms.yaml`, first via exact/substring match, then via RapidFuzz for typo tolerance.
-3. **Action** (turn on/off, raise/lower, status query, or a numeric value like a percentage or temperature) is resolved from the same normalized text — questions ("is the light on?") are prioritized over plain toggle words so status checks don't accidentally trigger a command.
-4. Candidates are retrieved from ChromaDB using progressive filtering: room + device class → device class only → room only → unfiltered vector search, so the semantic tags do the heavy lifting and the embedding model only has to rank within a small, already-relevant set.
-5. If the top two candidates are too close to distinguish, the bridge asks you to clarify instead of guessing.
-6. Follow-up commands ("turn it off") resolve the previously used device from the conversation history Open WebUI sends with every request — no shared state between different chats or users.
+1. If the message names an exact openHAB item ID, that item is used directly — no further resolution needed.
+2. Otherwise the message is normalized (lowercased, umlauts folded: `ä` → `ae`, etc.).
+3. **Device class** (Equipment *or* Property tag, e.g. both "Lightbulb" and "Light" count) and **room** are resolved against your openHAB Semantic Model + `synonyms.yaml`, first via exact/substring match, then via RapidFuzz for typo tolerance. A query can resolve to *several* candidate tags for the same word (e.g. "licht" matching both an Equipment and a Property tag) — all of them count.
+4. **Action** (turn on/off, raise/lower, status query, or a numeric value) is resolved from the same normalized text — questions ("is the light on?") are prioritized over plain toggle words.
+5. The full item list (cached in memory after each sync) is **hard-filtered in Python**: an item must match the resolved device class *or* room via either signal (resolved semantic tag, or a plain substring hit in its own name/label/groups) for every dimension the query actually resolved. Nothing is shown just because the embedding model thought it was similar. If filtering by both dimensions yields nothing, dimensions are relaxed one at a time (never both at once) before anything is dropped entirely.
+6. Only if the query resolved *no* known room/device vocabulary at all does the bridge fall back to a free vector search over the whole item corpus, as a last resort.
+7. The embedding model ranks the (already filtered, small) candidate list — it never decides *whether* an item is relevant, only their *order*.
+8. If several same-type devices remain after filtering, the bridge asks you to clarify, listing the actual item names (not just labels, which are often duplicated, e.g. multiple items labeled "Schalter").
+9. Follow-up commands ("turn it off") resolve the previously used device from the conversation history Open WebUI sends with every request — no shared state between different chats or users.
 
 ---
 
 ## Notes
 
-- The exact JSON schema of `/rest/tags` can vary slightly between openHAB versions (e.g. field names `uid` vs. `name`). The parser in `app.py` tries the common variants defensively; use `/api/tags` after your first sync to confirm rooms/devices were classified as expected, and adjust the field names in `fetch_openhab_tag_registry()` if needed for your version.
+- The exact JSON schema of `/rest/tags` and of the `semantics` item-metadata can vary slightly between openHAB versions (e.g. field names `uid` vs. `name`). The parsers in `app.py` try the common variants defensively; use `/api/tags` and `/api/items/{name}` after your first sync to confirm rooms/devices were classified as expected, and adjust field names in `resolve_item_semantics()` / `fetch_openhab_tag_registry()` if needed for your version.
+- Room/device filtering is intentionally **hard** (an item must match, not just "seem similar"). If a query returns "kein passendes Gerät gefunden" even though you know the device exists, check `/api/items/{name}` for that device — most likely neither the semantics-metadata chain nor a substring match in its name/label/groups covers the word you used, which is exactly what `synonyms.yaml` is for.
 - This project intentionally does not use an LLM, TensorFlow/Rasa/spaCy intent classifier, or a training database/admin UI — all of that would reintroduce the CPU/GPU cost this bridge is designed to avoid. `synonyms.yaml` is the lightweight, file-based equivalent.
