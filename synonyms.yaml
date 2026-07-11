@@ -80,11 +80,11 @@ location:
 # WAS ein Gerät ist, nicht WIE man es befehligt) -> muss immer hier
 # gepflegt werden.
 actions:
-  ON: [an, ein, einschalten, aktivieren, starte, mach an, mach ein, öffne, oeffne, on]
-  OFF: [aus, ausschalten, deaktivieren, stoppe, mach aus, schließe, schliesse, off]
-  UP: [hoch, rauf, hochfahren, oeffnen, up]
-  DOWN: [runter, herunter, herunterfahren, down]
-  STATUS: [status, zustand, wie, wert, ist, sind, hat, läuft, laeuft, gibt, warm, kalt, grad, temperatur, prozent]
+  "ON": [an, ein, einschalten, aktivieren, starte, "mach an", "mach ein", öffne, oeffne, "on"]
+  "OFF": [aus, ausschalten, deaktivieren, stoppe, "mach aus", schließe, schliesse, "off"]
+  "UP": [hoch, rauf, hochfahren, oeffnen, "up"]
+  "DOWN": [runter, herunter, herunterfahren, "down"]
+  "STATUS": [status, zustand, wie, wert, ist, sind, hat, läuft, laeuft, gibt, warm, kalt, grad, temperatur, prozent]
 
 # Schwellenwerte für Fuzzy-Matching (RapidFuzz token_sort_ratio, 0-100)
 fuzzy:

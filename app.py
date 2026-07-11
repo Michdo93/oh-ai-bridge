@@ -1,19 +1,22 @@
 import os
 import re
 import uuid
+import pickle
 import logging
 from typing import List, Dict, Any, Optional, Set, Tuple
 
-import requests
 import yaml
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import chromadb
-from chromadb.utils import embedding_functions
 from rapidfuzz import fuzz
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# python-openhab-rest-client (PyPI: python-openhab-rest-client, import name: openhab)
+from openhab import OpenHABClient, Items, Tags
 
 # =====================================================================
 # 0. KONFIGURATION (.env statt Klartext-Credentials im Code)
@@ -24,13 +27,14 @@ OPENHAB_URL = os.getenv("OPENHAB_URL", "http://192.168.0.10:8080").rstrip("/")
 OPENHAB_TOKEN = os.getenv("OPENHAB_TOKEN", "")
 API_KEY = os.getenv("API_KEY", "your_local_key")
 SYNONYMS_PATH = os.getenv("SYNONYMS_PATH", "./synonyms.yaml")
-CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+# Ersetzt den alten CHROMA_PATH: statt einer Vektordatenbank nur noch ein
+# einziges Pickle-File mit Item-Metadaten + Dokumenten (s. Abschnitt 6/7).
+CACHE_PATH = os.getenv("CACHE_PATH", "./item_cache.pkl")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("oh-ai-bridge")
 
-app = FastAPI(title="openHAB Semantic Hybrid Bridge v5")
+app = FastAPI(title="openHAB Semantic Hybrid Bridge v6")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,17 +44,25 @@ app.add_middleware(
 )
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
-chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
-collection = chroma_client.get_or_create_collection(name="openhab_items", embedding_function=emb_fn)
+# --- openHAB-Client (python-openhab-rest-client) -----------------------
+oh_client = OpenHABClient(url=OPENHAB_URL, token=OPENHAB_TOKEN or None)
+items_api = Items(oh_client)
+tags_api = Tags(oh_client)
 
-HEADERS_JSON = {"Authorization": f"Bearer {OPENHAB_TOKEN}", "Accept": "application/json"}
 
-
-# --- HELFER: UMLAUT-BEREINIGUNG ---
-def normalize_text(text: str) -> str:
-    """ Konvertiert deutsche Umlaute in ASCII-Schreibweise (ä -> ae, etc.) """
-    text = (text or "").lower().strip()
+# --- HELFER: UMLAUT-BEREINIGUNG (jetzt defensiv gegen Nicht-Strings) ---
+def normalize_text(text: Any) -> str:
+    """ Konvertiert deutsche Umlaute in ASCII-Schreibweise (ä -> ae, etc.).
+    Nimmt bewusst auch Nicht-Strings entgegen: YAML parst unquotierte
+    'on'/'off'/'yes'/'no' als Booleans (YAML-1.1-Altlast) -- ein einzelner
+    vergessener Quote in synonyms.yaml darf den ganzen Dienst nicht mehr
+    zum Absturz bringen (siehe (str) statt (True or "").lower())."""
+    if not isinstance(text, str):
+        log.warning(f"[CONFIG] Erwartete Text-Zeichenkette, bekam {type(text).__name__}: {text!r}. "
+                    f"Falls das aus synonyms.yaml stammt: 'on'/'off'/'yes'/'no' MÜSSEN in "
+                    f"Anführungszeichen stehen, sonst parst YAML sie als Boolean.")
+        text = "" if text is None else str(text)
+    text = text.lower().strip()
     replacements = {'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss'}
     for umlaut, rep in replacements.items():
         text = text.replace(umlaut, rep)
@@ -77,30 +89,40 @@ def load_synonym_config() -> Dict[str, Any]:
 SYN_CONFIG = load_synonym_config()
 FUZZY_MIN_SCORE = SYN_CONFIG.get("fuzzy", {}).get("min_score", 82)
 
-# Kanonischer Tag-Name -> Set von Wörtern (z.B. "Lightbulb" -> {"licht","lampe",...})
-# Enthält NACH dem Sync sowohl Equipment- als auch Property-Tags (siehe unten,
-# Grund: viele reale Setups taggen nur den Point mit einer Property wie "Light",
-# ohne ein separates Equipment "Lightbulb" zu modellieren -- dein
-# iKueche_Hue_Lampen_Schalter ist genau so ein Fall).
 DEVICE_SYNONYMS: Dict[str, Set[str]] = {}
 LOCATION_SYNONYMS: Dict[str, Set[str]] = {}
 
 
-def _merge_synonym_dict(base_cfg: Dict[str, List[str]], target: Dict[str, Set[str]]):
+def _clean_words(raw_words: List[Any], context: str) -> Set[str]:
+    """Filtert nicht-String-Werte defensiv heraus (s. normalize_text-Docstring)
+    statt beim ersten falschen YAML-Typ den ganzen Sync/Start abzubrechen."""
+    cleaned = set()
+    for w in raw_words:
+        if not isinstance(w, str):
+            log.warning(f"[CONFIG] Ignoriere Nicht-Text-Wert in synonyms.yaml ({context}): {w!r}. "
+                        f"Vermutlich fehlen Anführungszeichen um 'on'/'off'/'yes'/'no' o.ä.")
+            continue
+        cleaned.add(normalize_text(w))
+    return cleaned
+
+
+def _merge_synonym_dict(base_cfg: Dict[str, List[Any]], target: Dict[str, Set[str]]):
     for tag, words in base_cfg.items():
         target.setdefault(tag, set())
-        for w in words:
-            target[tag].add(normalize_text(w))
+        target[tag] |= _clean_words(words, f"equipment/location.{tag}")
 
 
-# --- ACTION-SYNONYME (rein YAML, kein Teil des openHAB Semantic Models) ---
 ACTION_WORDS: Dict[str, Set[str]] = {}
 
 
 def build_action_table():
     ACTION_WORDS.clear()
     for action, words in SYN_CONFIG.get("actions", {}).items():
-        ACTION_WORDS[action] = {normalize_text(w) for w in words}
+        if not isinstance(action, str):
+            log.warning(f"[CONFIG] Ignoriere Nicht-Text-Aktionsschlüssel in synonyms.yaml: {action!r} "
+                        f"(vermutlich 'ON'/'OFF' ohne Anführungszeichen -> von YAML als Boolean geparst).")
+            continue
+        ACTION_WORDS[action] = _clean_words(words, f"actions.{action}")
 
 
 build_action_table()
@@ -109,22 +131,6 @@ build_action_table()
 # =====================================================================
 # 2. OPENHAB SEMANTIC MODEL (dieselbe Quelle wie HABot)
 # =====================================================================
-# Zwei unabhängige Signalquellen, die wir BEIDE nutzen (nicht nur eine!),
-# weil reale openHAB-Installationen selten vollständig durchmodelliert sind:
-#
-#   A) Die "semantics"-Metadata pro Item (value="Point_Control",
-#      config.relatesTo="Property_Light", config.isPointOf="gKueche_Lampen").
-#      Das ist exakt das, was openHAB selbst berechnet -- zuverlässiger als
-#      reine Tag-Namen, aber nur vorhanden wenn ?metadata=... angefragt wird.
-#   B) Der reine Text (Name/Label/Gruppen-Namen) des Items, z.B.
-#      "iKueche_Hue_Lampen_Schalter" enthält "kueche" und "lampen" wörtlich.
-#      Das ist die übliche openHAB-Namenskonvention und ein sehr robustes,
-#      von der Modellierungs-Vollständigkeit unabhängiges Signal.
-#
-# Wenn (A) nichts liefert, greift (B). Wenn beide nichts liefern, ist das
-# ein echtes "ich kenne dieses Wort nicht"-Fall -- dann (und nur dann) darf
-# auf die freie Vektorsuche zurückgefallen werden.
-
 _TAG_PARENT: Dict[str, Optional[str]] = {}
 _TAG_SYNONYMS_DE: Dict[str, List[str]] = {}
 _TAG_CATEGORY_CACHE: Dict[str, Optional[str]] = {}
@@ -132,18 +138,14 @@ ROOT_CATEGORIES = {"Location", "Equipment", "Point", "Property"}
 
 
 def fetch_openhab_tag_registry() -> bool:
-    """Lädt /rest/tags (deutsche Synonyme via Accept-Language). Nur genutzt
-    um rohe Item-Tags (Fallback B ohne semantics-Metadata) zu kategorisieren."""
+    """Lädt die Tag-Hierarchie über Tags.getTags() (python-openhab-rest-client)
+    statt eines rohen requests.get auf /rest/tags."""
     global _TAG_PARENT, _TAG_SYNONYMS_DE, _TAG_CATEGORY_CACHE
     _TAG_PARENT = {}
     _TAG_SYNONYMS_DE = {}
     _TAG_CATEGORY_CACHE = {}
     try:
-        headers = dict(HEADERS_JSON)
-        headers["Accept-Language"] = "de"
-        res = requests.get(f"{OPENHAB_URL}/rest/tags", headers=headers, timeout=20)
-        res.raise_for_status()
-        tags = res.json()
+        tags = tags_api.getTags(language="de")
         if not isinstance(tags, list):
             return False
         for t in tags:
@@ -164,15 +166,14 @@ def fetch_openhab_tag_registry() -> bool:
             syns.append(uid.split("_")[-1])
             _TAG_PARENT[uid] = parent
             _TAG_SYNONYMS_DE[uid] = syns
-        log.info(f"[SEMANTIC] {len(tags)} Tags von {OPENHAB_URL}/rest/tags geladen.")
+        log.info(f"[SEMANTIC] {len(tags)} Tags über Tags.getTags() geladen.")
         return True
     except Exception as e:
-        log.warning(f"[SEMANTIC] /rest/tags nicht verfügbar ({e}). Nutze YAML-Fallback für Räume/Geräte.")
+        log.warning(f"[SEMANTIC] Tags.getTags() nicht verfügbar ({e}). Nutze YAML-Fallback für Räume/Geräte.")
         return False
 
 
 def tag_category(uid: Optional[str]) -> Optional[str]:
-    """Läuft die Parent-Kette hoch bis Location/Equipment/Point/Property."""
     if not uid:
         return None
     if uid in _TAG_CATEGORY_CACHE:
@@ -190,8 +191,6 @@ def tag_category(uid: Optional[str]) -> Optional[str]:
 
 
 def build_synonym_tables_from_openhab():
-    """Baut DEVICE_SYNONYMS (Equipment UND Property!) und LOCATION_SYNONYMS
-    aus der geladenen Tag-Hierarchie, merged mit der YAML-Fallback-Konfiguration."""
     global DEVICE_SYNONYMS, LOCATION_SYNONYMS
     DEVICE_SYNONYMS = {}
     LOCATION_SYNONYMS = {}
@@ -213,10 +212,6 @@ def build_synonym_tables_from_openhab():
 
 
 def resolve_tags(normalized_query: str, synonym_table: Dict[str, Set[str]]) -> Set[str]:
-    """Gibt ALLE kanonischen Tags zurück, deren Synonym-Wort in der Anfrage
-    vorkommt (Substring ODER Fuzzy je Token). Bewusst eine MENGE statt eines
-    einzelnen Tags: 'licht' kann z.B. sowohl als Equipment 'Lightbulb' als
-    auch als Property 'Light' modelliert sein -- beide sollen zählen."""
     matched: Set[str] = set()
     tokens = normalized_query.split()
     for tag, words in synonym_table.items():
@@ -237,28 +232,18 @@ def resolve_tags(normalized_query: str, synonym_table: Dict[str, Set[str]]) -> S
 
 
 def resolve_action(query_lower: str) -> Optional[str]:
-    # 0. "Welche Geräte/Lampen/Items gibt es...": Aufzählung statt Einzel-Item.
-    #    Muss VOR dem STATUS-Check laufen ("gibt es" würde sonst als STATUS-
-    #    Präfix erkannt werden).
     if query_lower.strip().startswith("welche") or any(
         p in query_lower for p in ["was gibt es", "was kannst du steuern", "welche gibt es"]
     ):
         return "LIST"
 
-    # 1. Direkte openHAB-Kommandos als eigenständige Wörter erkennen (Power-
-    #    User-Syntax: "Sende ON an X", "schalten ON", "Command OFF"). Das ist
-    #    KEIN Teil der deutschen Synonym-Liste, weil ON/OFF/UP/DOWN feste,
-    #    sprachunabhängige openHAB-Befehlsnamen sind, keine Umgangssprache.
     tokens = re.findall(r"[a-z]+", query_lower)
     token_set = set(tokens)
-    direct = {
-        "on": "ON", "off": "OFF", "up": "UP", "down": "DOWN",
-    }
+    direct = {"on": "ON", "off": "OFF", "up": "UP", "down": "DOWN"}
     for word, mapped in direct.items():
         if word in token_set:
             return mapped
 
-    # 2. Fragen ("ist ... an?") haben Vorrang vor reinen An/Aus-Wörtern.
     if query_lower.strip().startswith(("sind ", "ist ", "hat ", "läuft ", "laeuft ", "gibt ", "wie ", "was ")):
         return "STATUS"
 
@@ -294,17 +279,6 @@ def _classify_value(value: Optional[str]) -> Tuple[Optional[str], Optional[str]]
 
 
 def resolve_item_semantics(item: dict, items_by_name: Dict[str, dict], max_depth: int = 4) -> Dict[str, Optional[str]]:
-    """Ermittelt location_tag / equipment_tag / property_tag für ein Item.
-
-    Quelle A (bevorzugt): die 'semantics'-Metadata (value + config.relatesTo /
-    isPointOf / isPartOf), also exakt das, was openHAB selbst berechnet.
-    Läuft dazu die isPointOf/isPartOf-Kette nach oben (Point -> Equipment ->
-    Location), analog zu HABots eigener Auflösung ('checks ancestor groups
-    one level at a time').
-
-    Quelle B (Fallback je Ebene): rohe Tags + /rest/tags-Kategorisierung,
-    für Items/Gruppen ohne semantics-Metadata.
-    """
     location_tag = equipment_tag = property_tag = None
     visited = set()
     current = item
@@ -348,7 +322,6 @@ def resolve_item_semantics(item: dict, items_by_name: Dict[str, dict], max_depth
                 current = items_by_name[next_name]
                 continue
 
-        # Fallback B: rohe Tags dieses Items/dieser Gruppe
         for t in current.get("tags", []):
             cat = tag_category(t)
             short = t.split("_")[-1] if "_" in t else t
@@ -362,7 +335,6 @@ def resolve_item_semantics(item: dict, items_by_name: Dict[str, dict], max_depth
         if location_tag and equipment_tag:
             break
 
-        # eine Ebene über groupNames weiterlaufen
         next_group = None
         for g in current.get("groupNames", []):
             if g not in visited and g in items_by_name:
@@ -377,7 +349,74 @@ def resolve_item_semantics(item: dict, items_by_name: Dict[str, dict], max_depth
 
 
 # =====================================================================
-# 5. SYNC: Items von openHAB holen (inkl. semantics-Metadata!) -> Chroma
+# 5. LEICHTGEWICHTIGER FALLBACK-RANKER (TF-IDF statt Embedding-Modell)
+# =====================================================================
+# Warum kein sentence-transformers/torch mehr:
+# - Ziel-Hardware ist ein Raspberry Pi 3 Model B+ (1.4 GHz Cortex-A53, 1 GB
+#   RAM) -- torch + ein Transformer-Modell sind dafür unverhältnismäßig
+#   schwer (Speicher, Startzeit, und der Prozess spricht bei jedem Start
+#   unauthentifiziert mit huggingface.co, was weder "ressourcenschonend"
+#   noch "ohne Cloud" ist).
+# - In dieser Architektur übernimmt die Vektorsuche ohnehin nur noch zwei
+#   Nebenrollen: (a) Tiebreaker innerhalb einer bereits durch Tags/Text
+#   hart gefilterten, kleinen Kandidatenliste, (b) letzter Ausweg, wenn GAR
+#   kein Raum-/Gerätewort erkannt wurde. Für beide Fälle reicht ein
+#   klassischer TF-IDF-Vektorraum (scikit-learn, reines C/NumPy, keine
+#   Modell-Downloads, Sync von 47.780 Items dauert damit Sekundenbruchteile
+#   statt eine GPU-Bibliothek zu laden) völlig aus.
+_vectorizer: Optional[TfidfVectorizer] = None
+_tfidf_matrix = None
+_name_to_row: Dict[str, int] = {}
+
+
+def build_tfidf_index(documents: List[str], names: List[str]):
+    global _vectorizer, _tfidf_matrix, _name_to_row
+    if not documents:
+        _vectorizer = None
+        _tfidf_matrix = None
+        _name_to_row = {}
+        return
+    _vectorizer = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=1)
+    _tfidf_matrix = _vectorizer.fit_transform(documents)
+    _name_to_row = {name: i for i, name in enumerate(names)}
+    log.info(f"[TFIDF] Index über {len(documents)} Dokumente gebaut "
+             f"({_tfidf_matrix.shape[1]} Terme).")
+
+
+def rank_candidates(normalized_query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rankt NUR innerhalb der bereits gefilterten (kleinen) Kandidatenliste."""
+    if len(candidates) <= 1 or _vectorizer is None or _tfidf_matrix is None:
+        return candidates
+    try:
+        rows = [_name_to_row[c["name"]] for c in candidates]
+    except KeyError:
+        return candidates
+    sub = _tfidf_matrix[rows]
+    qvec = _vectorizer.transform([normalized_query])
+    sims = cosine_similarity(qvec, sub)[0]
+    ranked = [c for _, c in sorted(zip(sims, candidates), key=lambda p: -p[0])]
+    return ranked
+
+
+def free_vector_fallback(normalized_query: str, n: int = 5) -> List[Dict[str, Any]]:
+    """Letzter Ausweg, wenn aus der Anfrage GAR kein Raum-/Geräte-Wort
+    aufgelöst werden konnte: TF-IDF-Cosine-Ähnlichkeit über den Gesamtbestand.
+    Auf 47.780 Items ein einzelnes Sparse-Matrix-Produkt -- Millisekunden,
+    auch auf einem Raspberry Pi 3."""
+    if _vectorizer is None or _tfidf_matrix is None:
+        return []
+    try:
+        qvec = _vectorizer.transform([normalized_query])
+        sims = cosine_similarity(qvec, _tfidf_matrix)[0]
+        top_idx = sims.argsort()[::-1][:n]
+        return [ITEM_CACHE[i] for i in top_idx if sims[i] > 0]
+    except Exception as e:
+        log.warning(f"[TFIDF] Freie Suche fehlgeschlagen ({e}).")
+        return []
+
+
+# =====================================================================
+# 6. SYNC: Items von openHAB holen (inkl. semantics-Metadata!) -> Cache
 # =====================================================================
 @app.post("/api/sync")
 def sync_items_to_vector_db():
@@ -385,17 +424,10 @@ def sync_items_to_vector_db():
     build_synonym_tables_from_openhab()
 
     try:
-        log.info("[SYNC] Rufe Items von openHAB ab (inkl. semantics-Metadata)...")
-        # WICHTIG: ohne ?metadata=.+ liefert /rest/items KEIN Metadata-Feld
-        # (im Unterschied zum Einzel-Item-GET, das es implizit mitliefert).
-        response = requests.get(
-            f"{OPENHAB_URL}/rest/items",
-            headers=HEADERS_JSON,
-            params={"metadata": ".+"},
-            timeout=180,  # bei mehreren Zehntausend Items (s. items_total) reichen 60s oft nicht
-        )
-        response.raise_for_status()
-        items = response.json()
+        log.info("[SYNC] Rufe Items von openHAB ab (Items.getAllItems, inkl. semantics-Metadata)...")
+        items = items_api.getAllItems(metadata=".+")
+        if not isinstance(items, list):
+            raise ValueError(f"Unerwartetes Antwortformat von Items.getAllItems(): {type(items)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Fehler beim openHAB-Verbindungsaufbau: {str(e)}")
 
@@ -441,16 +473,7 @@ def sync_items_to_vector_db():
         if openbrain_role:
             semantic_text += f" rolle: {openbrain_role.lower()}."
 
-        # match_text: normalisierter Volltext für den harten Substring-Filter
-        # (Signalquelle B) -- unabhängig davon, ob die semantische
-        # Klassifizierung (Signalquelle A) funktioniert hat.
         match_text = normalize_text(f"{name} {label} {tags_str} {groups_str}")
-        # match_tokens: Wort-Grenzen-sichere Tokens (per Regex getrennt).
-        # WICHTIG: verhindert False Positives durch zufällige Substrings in
-        # zusammengeschriebenen Titeln/Namen, z.B. steckt "licht" rein
-        # zeichenweise in "Herzlichtutmichverlangen" (Bach-Kantatentitel ohne
-        # Leerzeichen) -- als eigenständiges TOKEN kommt "licht" darin aber
-        # nicht vor, nur als Substring mitten in einem viel längeren Token.
         match_tokens = " ".join(re.findall(r"[a-z0-9]+", match_text))
 
         ids.append(name)
@@ -466,23 +489,16 @@ def sync_items_to_vector_db():
             "match_tokens": match_tokens,
         })
 
-    batch_size = 5000
-    log.info("[SYNC] Schreibe Daten in die lokale Vektordatenbank...")
-    for i in range(0, len(ids), batch_size):
-        collection.upsert(
-            ids=ids[i:i + batch_size],
-            documents=documents[i:i + batch_size],
-            metadatas=metadatas[i:i + batch_size],
-        )
-
-    # WICHTIG: Cache direkt aus den bereits im Speicher vorhandenen Sync-
-    # Daten aufbauen, statt sie per collection.get() aus Chroma erneut zu
-    # holen. Ein bare collection.get() über sehr viele Items (hier: 47.780)
-    # kann in Chroma an interne Limits stoßen ("Error executing plan").
-    # Der teure, paginierte collection.get()-Weg (rebuild_item_cache) bleibt
-    # als Fallback für den Server-Neustart erhalten, wo kein In-Memory-Stand
-    # existiert.
     set_item_cache(metadatas)
+    build_tfidf_index(documents, ids)
+
+    try:
+        with open(CACHE_PATH, "wb") as f:
+            pickle.dump({"metadatas": metadatas, "documents": documents}, f)
+        log.info(f"[SYNC] Cache nach {CACHE_PATH} persistiert.")
+    except Exception as e:
+        log.warning(f"[SYNC] Konnte Cache nicht persistieren ({e}). Nach einem Neustart ist erneut /api/sync nötig.")
+
     classified = sum(1 for m in metadatas if m["location_tag"] or m["equipment_tag"] or m["property_tag"])
     log.info("[SYNC] Synchronisierung abgeschlossen.")
     return {
@@ -505,98 +521,163 @@ def debug_tag_registry():
 
 @app.get("/api/items/{item_name}")
 def debug_item(item_name: str):
-    """Zeigt, wie die Bridge ein konkretes Item klassifiziert hat -- zum
-    Nachvollziehen, z.B. curl http://127.0.0.1:8000/api/items/iKueche_Hue_Lampen_Schalter"""
-    try:
-        result = collection.get(ids=[item_name])
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    if not result or not result.get("ids"):
-        raise HTTPException(status_code=404, detail="Item nicht in der Vektordatenbank. Erst /api/sync ausführen.")
-    return {"metadata": result["metadatas"][0], "document": result["documents"][0]}
+    meta = ITEM_BY_NAME.get(item_name)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Item nicht im Cache. Erst /api/sync ausführen.")
+    return {"metadata": meta}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "items_cached": len(ITEM_CACHE)}
+    return {"status": "ok", "items_cached": len(ITEM_CACHE), "tfidf_ready": _vectorizer is not None}
 
 
 # =====================================================================
-# 6. REST-INTERAKTION MIT OPENHAB
-# =====================================================================
-def execute_openhab_command(item_name: str, command: str) -> str:
-    headers = {"Authorization": f"Bearer {OPENHAB_TOKEN}", "Content-Type": "text/plain"}
-    res = requests.post(f"{OPENHAB_URL}/rest/items/{item_name}", data=command, headers=headers, timeout=15)
-    return "Erfolgreich geschaltet" if res.status_code == 200 else f"Fehler (Status {res.status_code})"
-
-
-def get_openhab_state(item_name: str) -> str:
-    headers = {"Authorization": f"Bearer {OPENHAB_TOKEN}"}
-    res = requests.get(f"{OPENHAB_URL}/rest/items/{item_name}/state", headers=headers, timeout=15)
-    return res.text if res.status_code == 200 else "Unbekannt"
-
-
-# =====================================================================
-# 7. IN-MEMORY ITEM-CACHE (deterministische Python-Filterung statt
-#    Chroma-`where`-Klauseln -- klein, schnell, leicht nachvollziehbar für
-#    die typische Item-Anzahl einer Smart-Home-Installation)
+# 7. IN-MEMORY ITEM-CACHE
 # =====================================================================
 ITEM_CACHE: List[Dict[str, Any]] = []
 ITEM_NAMES: Set[str] = set()
 ITEM_BY_NAME: Dict[str, Dict[str, Any]] = {}
 
-# Chroma's bare collection.get() can fail on very large collections ("Error
-# executing plan: Internal error") -- fetch in bounded pages instead.
-CACHE_PAGE_SIZE = 2000
-
 
 def set_item_cache(metadatas: List[Dict[str, Any]]):
-    """Baut den In-Memory-Cache direkt aus bereits geladenen Metadaten auf
-    (z.B. unmittelbar nach einem Sync) -- ohne erneuten Chroma-Request."""
     global ITEM_CACHE, ITEM_NAMES, ITEM_BY_NAME
     ITEM_CACHE = [dict(m) for m in metadatas]
     ITEM_NAMES = {m["name"] for m in ITEM_CACHE}
     ITEM_BY_NAME = {m["name"]: m for m in ITEM_CACHE}
-    log.info(f"[CACHE] {len(ITEM_CACHE)} Items im Speicher-Cache (direkt aus Sync).")
+    log.info(f"[CACHE] {len(ITEM_CACHE)} Items im Speicher-Cache.")
 
 
-def rebuild_item_cache():
-    """Lädt den Cache paginiert aus Chroma -- nötig nach einem Server-
-    Neustart, wenn kein In-Memory-Stand aus einem gerade gelaufenen Sync
-    existiert (Chroma selbst ist persistent, der Python-Cache nicht)."""
-    global ITEM_CACHE, ITEM_NAMES, ITEM_BY_NAME
-    items: List[Dict[str, Any]] = []
+def load_cache_from_disk() -> bool:
+    """Beim Serverstart: lädt den zuletzt gespeicherten Stand von der
+    Festplatte (ein einzelnes Pickle-File statt einer Vektordatenbank),
+    damit nach einem Neustart nicht zwingend sofort /api/sync nötig ist."""
+    if not os.path.exists(CACHE_PATH):
+        log.warning(f"[CACHE] {CACHE_PATH} existiert noch nicht. Bitte /api/sync ausführen.")
+        return False
     try:
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            page = collection.get(include=["metadatas"], limit=CACHE_PAGE_SIZE, offset=offset)
-            page_ids = page.get("ids", [])
-            page_metas = page.get("metadatas", [])
-            if not page_ids:
-                break
-            items.extend(dict(m) for m in page_metas)
-            offset += len(page_ids)
-        ITEM_CACHE = items
-        ITEM_NAMES = {m["name"] for m in ITEM_CACHE}
-        ITEM_BY_NAME = {m["name"]: m for m in ITEM_CACHE}
-        log.info(f"[CACHE] {len(ITEM_CACHE)} Items paginiert aus Chroma geladen.")
+        with open(CACHE_PATH, "rb") as f:
+            data = pickle.load(f)
+        metadatas = data.get("metadatas", [])
+        documents = data.get("documents", [])
+        set_item_cache(metadatas)
+        build_tfidf_index(documents, [m["name"] for m in metadatas])
+        log.info(f"[CACHE] {len(metadatas)} Items von {CACHE_PATH} geladen.")
+        return True
     except Exception as e:
-        log.warning(f"[CACHE] Konnte Item-Cache nicht laden ({e}). Erst /api/sync ausführen.")
-        ITEM_CACHE = []
-        ITEM_NAMES = set()
-        ITEM_BY_NAME = {}
+        log.warning(f"[CACHE] Konnte {CACHE_PATH} nicht laden ({e}). Bitte /api/sync ausführen.")
+        return False
 
 
+# =====================================================================
+# 8. REST-INTERAKTION MIT OPENHAB (über python-openhab-rest-client)
+# =====================================================================
+# HINWEIS zur "Test Suite": python-openhab-rest-client bringt ein
+# `openhab.tests`-Modul mit (z.B. ItemsTest.testSendCommand) mit. Laut
+# eigener Dokumentation des Pakets führt das aber den echten Befehl trotzdem
+# aus ("both would also really execute a sendCommand") -- es ist also KEIN
+# Dry-Run, sondern nur ein try/except-Wrapper mit Print-Ausgabe um dieselbe
+# Aktion. Für "darf dieses Item diesen Befehl überhaupt bekommen" bringt das
+# keinen Sicherheitsgewinn gegenüber einem echten Aufruf. Deshalb prüfen wir
+# stattdessen LOKAL (ohne Netzwerk-Aufruf, ohne Seiteneffekt), ob der
+# Item-Typ den Befehl überhaupt sinnvoll unterstützt, BEVOR wir senden.
+VALID_COMMANDS_BY_TYPE: Dict[str, Set[str]] = {
+    "Switch": {"ON", "OFF"},
+    "Dimmer": {"ON", "OFF", "INCREASE", "DECREASE"},
+    "Color": {"ON", "OFF"},
+    "Rollershutter": {"UP", "DOWN", "STOP", "MOVE"},
+    "Number": set(),  # nur numerische Werte sinnvoll (s. Regex-Zweig oben in command_allowed)
+}
+
+
+def command_allowed(item_type: str, command: str) -> bool:
+    """Lokale Plausibilitätsprüfung ohne Netzwerk-Aufruf: verhindert z.B.
+    'ON' an ein Number- oder String-Item zu senden. Numerische Befehle
+    (Prozent, Grad) sind für Dimmer/Number/Rollershutter/Color immer erlaubt."""
+    if re.match(r"^-?\d+(\.\d+)?$", command):
+        return item_type in ("Dimmer", "Number", "Rollershutter", "Color") or item_type.startswith("Number:")
+    if item_type not in VALID_COMMANDS_BY_TYPE:
+        # Unbekannter/nicht gelisteter Typ (String, Contact, DateTime, ...):
+        # nicht blockieren, openHAB validiert selbst -- wir wollen nur die
+        # eindeutig unsinnigen Fälle lokal abfangen, nicht raten.
+        return True
+    return command.upper() in VALID_COMMANDS_BY_TYPE[item_type]
+
+
+def execute_openhab_command(item_name: str, command: str, item_type: str = "") -> str:
+    if item_type and not command_allowed(item_type, command):
+        return f"Abgelehnt: Befehl '{command}' passt nicht zum Item-Typ '{item_type}'."
+    try:
+        items_api.sendCommand(item_name, command)
+        return "Erfolgreich geschaltet"
+    except Exception as e:
+        log.warning(f"[OPENHAB] sendCommand({item_name}, {command}) fehlgeschlagen: {e}")
+        return f"Fehler: {e}"
+
+
+def get_openhab_state(item_name: str) -> str:
+    try:
+        result = items_api.getItemState(item_name)
+        if isinstance(result, dict):
+            return str(result.get("state", "Unbekannt"))
+        if result is None:
+            return "Unbekannt"
+        return str(result)
+    except Exception as e:
+        log.warning(f"[OPENHAB] getItemState({item_name}) fehlgeschlagen: {e}")
+        return "Unbekannt"
+
+
+# =====================================================================
+# 9. KONTEXT-GEDÄCHTNIS AUS DER CONVERSATION (statt globaler Variable)
+# =====================================================================
+ITEM_REF_PATTERN = re.compile(r"`([A-Za-z0-9_]+)`")
+
+
+def find_last_used_item(messages: List[ChatMessage]) -> Optional[str]:
+    for msg in reversed(messages[:-1]):
+        if msg.role != "assistant":
+            continue
+        for candidate in ITEM_REF_PATTERN.findall(msg.content):
+            if candidate in ITEM_NAMES:
+                return candidate
+    return None
+
+
+def find_exact_item_reference(user_query: str) -> Optional[str]:
+    for token in re.findall(r"[A-Za-z0-9_]+", user_query):
+        if token in ITEM_NAMES:
+            return token
+    return None
+
+
+def get_item_meta(item_name: str) -> Optional[Dict[str, Any]]:
+    return ITEM_BY_NAME.get(item_name)
+
+
+# =====================================================================
+# 10. NUMERISCHE WERTE (Prozent / Grad) SAUBER PARSEN
+# =====================================================================
+NUMBER_PATTERN = re.compile(r"(\d+(?:[.,]\d+)?)\s*(%|prozent|grad|°c?|°)?")
+
+
+def extract_numeric_command(user_query: str) -> Optional[str]:
+    match = NUMBER_PATTERN.search(user_query)
+    if not match:
+        return None
+    value = match.group(1).replace(",", ".")
+    if value.endswith(".0"):
+        value = value[:-2]
+    return value
+
+
+# =====================================================================
+# 11. KANDIDATEN-FILTERUNG, TYP-/INDEX-EINENGUNG
+# =====================================================================
 ACTIONABLE_TYPES_ON_OFF = {"Switch", "Dimmer", "Color", "Rollershutter"}
 
 
 def _token_hits(tokens_str: str, words: Set[str]) -> bool:
-    """Wort-Grenzen-sicherer Treffer: exaktes Token, Token-Präfix (Plural wie
-    'lampen' vs. 'lampe'), oder Fuzzy nur zwischen ähnlich LANGEN Tokens.
-    Die Längen-Bremse verhindert genau den Bach-Kantaten-Fall: ein 25 Zeichen
-    langes Token wird nicht mehr fälschlich gegen ein 5-Zeichen-Wort wie
-    'licht' gematcht, egal was rapidfuzz sonst an Teilstring-Heuristiken macht."""
     for token in tokens_str.split():
         for w in words:
             if not w:
@@ -610,22 +691,7 @@ def _token_hits(tokens_str: str, words: Set[str]) -> bool:
     return False
 
 
-def filter_candidates(
-    device_tags: Set[str],
-    location_tags: Set[str],
-    action: Optional[str],
-) -> List[Dict[str, Any]]:
-    """Harter Python-Filter über den Item-Cache.
-
-    WICHTIG (Fix ggü. der Vorversion): Signalquelle A (aufgelöste Semantic-
-    Tags) hat Vorrang vor Signalquelle B (Text-Tokens). Hat ein Item bereits
-    eine bekannte Klassifizierung für eine Dimension, wird NUR diese geprüft
-    -- der Text-Fallback greift ausschließlich für Items OHNE jede
-    Klassifizierung. Sonst würde ein Item, das korrekt als 'Speaker'
-    klassifiziert ist, trotzdem durchrutschen, nur weil sein Name zufällig
-    auch noch "licht" als Teilstring enthält.
-    """
-
+def filter_candidates(device_tags: Set[str], location_tags: Set[str], action: Optional[str]) -> List[Dict[str, Any]]:
     def matches_device(it: Dict[str, Any]) -> bool:
         if not device_tags:
             return True
@@ -649,24 +715,17 @@ def filter_candidates(
         return _token_hits(it.get("match_tokens", ""), words)
 
     candidates = [it for it in ITEM_CACHE if matches_device(it) and matches_location(it)]
-    candidates = narrow_by_type(candidates, action)
-    return candidates
+    return narrow_by_type(candidates, action)
 
 
 def narrow_by_type(candidates: List[Dict[str, Any]], action: Optional[str]) -> List[Dict[str, Any]]:
-    """Blendet reine Hilfs-Punkte aus (Transition-Zeiten, Schedule-Strings,
-    RGB-Text-Spiegel, Alarm-Modus...), die technisch zum selben Gerät gehören
-    und daher dieselben Tags/Substrings mitbringen, aber nie das sind, was
-    mit 'ist das Licht an' oder 'schalte an' gemeint ist."""
     if len(candidates) <= 1:
         return candidates
-
     non_string = [c for c in candidates if c.get("type") != "String"]
     if non_string:
         candidates = non_string
     if len(candidates) <= 1:
         return candidates
-
     if action in ("ON", "OFF"):
         typed = [c for c in candidates if c.get("type") in ACTIONABLE_TYPES_ON_OFF]
         if typed:
@@ -675,7 +734,6 @@ def narrow_by_type(candidates: List[Dict[str, Any]], action: Optional[str]) -> L
         switches = [c for c in candidates if c.get("type") == "Switch"]
         if switches:
             candidates = switches
-
     return candidates
 
 
@@ -683,9 +741,6 @@ INDEX_PATTERN_CACHE: Dict[str, re.Pattern] = {}
 
 
 def extract_item_index(tokens_str: str, words: Set[str]) -> Optional[int]:
-    """Findet eine Geräte-Nummer wie 'lampe1', 'lampe 2', 'steckdose3' als
-    eigenes Token oder Token+Zahl-Kombination. Nutzt für dasselbe Wortset
-    kompilierte Regexe wieder (Performance bei 47.780 Items)."""
     key = "|".join(sorted(words))
     pattern = INDEX_PATTERN_CACHE.get(key)
     if pattern is None:
@@ -699,133 +754,31 @@ def extract_item_index(tokens_str: str, words: Set[str]) -> Optional[int]:
 
 
 def narrow_by_index(candidates: List[Dict[str, Any]], normalized_query: str, device_tags: Set[str]) -> List[Dict[str, Any]]:
-    """Unterscheidet z.B. 'iBad_Hue_Lampen_Schalter' (ALLE Lampen im Raum)
-    von 'iBad_Hue_Lampe1_Schalter' (EINE bestimmte Lampe):
-    - Nennt die Anfrage eine Nummer ("Lampe 2", "Lampe2") -> nur Items mit
-      genau dieser Nummer im Namen behalten.
-    - Nennt die Anfrage KEINE Nummer -> das kollektive (nicht-nummerierte)
-      Item bevorzugen, wenn eines existiert (das ist die naheliegendste
-      Deutung von 'das Licht im Bad einschalten')."""
     if len(candidates) <= 1 or not device_tags:
         return candidates
-
     words: Set[str] = set()
     for tag in device_tags:
         words |= DEVICE_SYNONYMS.get(tag, set())
     if not words:
         return candidates
-
     query_index = extract_item_index(normalized_query, words)
-
     if query_index is not None:
         narrowed = [c for c in candidates if extract_item_index(c.get("match_tokens", ""), words) == query_index]
         return narrowed or candidates
-
     collective = [c for c in candidates if extract_item_index(c.get("match_tokens", ""), words) is None]
     return collective or candidates
-
-
-# =====================================================================
-# 8. KONTEXT-GEDÄCHTNIS AUS DER CONVERSATION (statt globaler Variable)
-# =====================================================================
-ITEM_REF_PATTERN = re.compile(r"`([A-Za-z0-9_]+)`")
-
-
-def find_last_used_item(messages: List[ChatMessage]) -> Optional[str]:
-    for msg in reversed(messages[:-1]):
-        if msg.role != "assistant":
-            continue
-        for candidate in ITEM_REF_PATTERN.findall(msg.content):
-            if candidate in ITEM_NAMES:
-                return candidate
-    return None
-
-
-def find_exact_item_reference(user_query: str) -> Optional[str]:
-    """Power-User-Shortcut: wird der exakte Item-Name im Text genannt
-    (z.B. 'Sende ON an iKueche_Hue_Lampen_Schalter'), diesen direkt nutzen
-    und die ganze Synonym-/Fuzzy-Pipeline überspringen."""
-    for token in re.findall(r"[A-Za-z0-9_]+", user_query):
-        if token in ITEM_NAMES:
-            return token
-    return None
-
-
-def get_item_meta(item_name: str) -> Optional[Dict[str, Any]]:
-    return ITEM_BY_NAME.get(item_name)
-
-
-# =====================================================================
-# 9. NUMERISCHE WERTE (Prozent / Grad) SAUBER PARSEN
-# =====================================================================
-NUMBER_PATTERN = re.compile(r"(\d+(?:[.,]\d+)?)\s*(%|prozent|grad|°c?|°)?")
-
-
-def extract_numeric_command(user_query: str) -> Optional[str]:
-    match = NUMBER_PATTERN.search(user_query)
-    if not match:
-        return None
-    value = match.group(1).replace(",", ".")
-    if value.endswith(".0"):
-        value = value[:-2]
-    return value
-
-
-# =====================================================================
-# 10. RANKING INNERHALB DER KANDIDATEN (Embeddings nur als Tiebreaker,
-#     NIEMALS mehr als Fallback über den gesamten unfiltierten Bestand,
-#     solange mindestens eine Dimension aus der Query aufgelöst wurde)
-# =====================================================================
-def rank_candidates(normalized_query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Rankt NUR innerhalb der bereits gefilterten (kleinen) Kandidatenliste.
-    Fragt Chroma gezielt über 'where name $in [...]' ab, NIEMALS über den
-    gesamten Bestand (bei 47.780 Items wäre n_results=len(ITEM_CACHE) eine
-    Katastrophe für CPU-Zeit und Speicher)."""
-    if len(candidates) <= 1:
-        return candidates
-    names = [c["name"] for c in candidates]
-    try:
-        results = collection.query(
-            query_texts=[normalized_query],
-            n_results=len(names),
-            where={"name": {"$in": names}},
-        )
-        order = {name: idx for idx, name in enumerate(results["ids"][0])}
-        ranked = sorted(candidates, key=lambda c: order.get(c["name"], len(order)))
-        # Falls Chroma aus irgendeinem Grund weniger/andere IDs zurückgibt
-        # als erwartet, nicht blind vertrauen -- nur übernehmen, wenn wirklich
-        # alle Kandidaten im Ranking auftauchen.
-        if len(order) >= len(candidates):
-            return ranked
-        return candidates
-    except Exception as e:
-        log.warning(f"[RANK] Vektor-Ranking fehlgeschlagen ({e}), behalte Cache-Reihenfolge.")
-        return candidates
-
-
-def free_vector_fallback(normalized_query: str, n: int = 5) -> List[Dict[str, Any]]:
-    """Letzter Ausweg, wenn aus der Anfrage GAR kein Raum-/Geräte-Wort
-    aufgelöst werden konnte: klassische, eng begrenzte Vektorsuche über den
-    Gesamtbestand (n klein halten -- bei 47.780 Items keine großen n_results!)."""
-    try:
-        results = collection.query(query_texts=[normalized_query], n_results=n)
-        return [ITEM_BY_NAME[i] for i in results["ids"][0] if i in ITEM_BY_NAME]
-    except Exception as e:
-        log.warning(f"[RANK] Freie Vektorsuche fehlgeschlagen ({e}).")
-        return []
 
 
 CLARIFY_MAX_OPTIONS = 4
 
 
 # =====================================================================
-# 11. HAUPT-AUFLÖSUNG EINER EINZELNEN ANFRAGE
+# 12. HAUPT-AUFLÖSUNG EINER EINZELNEN ANFRAGE
 # =====================================================================
 def resolve_single_query(user_query: str, last_item_hint: Optional[str]) -> str:
     normalized_query = normalize_text(user_query)
     query_lower = user_query.lower()
 
-    # Power-User-Shortcut: exakter Item-Name genannt -> direkt nutzen.
     exact_name = find_exact_item_reference(user_query)
     if exact_name:
         best_item_meta = get_item_meta(exact_name)
@@ -847,12 +800,6 @@ def resolve_single_query(user_query: str, last_item_hint: Optional[str]) -> str:
     if not ITEM_CACHE:
         return "Die Item-Datenbank ist leer. Bitte zuerst /api/sync ausführen."
 
-    # KERN-FIX: Wenn wir WIRKLICH kein Raum-/Gerätewort kennen, NIEMALS
-    # filter_candidates() mit zwei leeren Mengen aufrufen -- das würde (per
-    # Definition "kein Filter gesetzt = alles passt") den KOMPLETTEN
-    # 47.780-Item-Bestand als "Kandidaten" zurückgeben, wovon dann nur die
-    # ersten paar (in Cache-Reihenfolge bzw. zufälligem Ranking) als
-    # "mehrdeutig" angezeigt würden -- genau der Bug, den du gesehen hast.
     if not device_tags and not location_tags:
         candidates = free_vector_fallback(normalized_query, n=3)
         if not candidates:
@@ -862,8 +809,6 @@ def resolve_single_query(user_query: str, last_item_hint: Optional[str]) -> str:
     candidates = filter_candidates(device_tags, location_tags, action)
 
     if not candidates:
-        # Kein Item erfüllt beide Dimensionen -> eine davon lockern, statt
-        # sofort auf den kompletten unfiltierten Bestand zu springen.
         if device_tags and location_tags:
             candidates = filter_candidates(device_tags, set(), action)
         if not candidates and location_tags:
@@ -874,20 +819,14 @@ def resolve_single_query(user_query: str, last_item_hint: Optional[str]) -> str:
     if not candidates:
         return "Ich konnte kein Gerät finden, das zu Raum/Gerätetyp deiner Anfrage passt. Prüfe ggf. mit /api/tags, ob dieser Raum/Gerätetyp bekannt ist."
 
-    # "Welche Lampen/Geräte gibt es im Bad?" -> Aufzählung statt Einzelauswahl.
     if action == "LIST":
         return build_list_response(candidates)
 
-    # Kollektiv- vs. Einzel-Gerät unterscheiden (z.B. 'iBad_Hue_Lampen_Schalter'
-    # = alle Lampen vs. 'iBad_Hue_Lampe1_Schalter' = eine bestimmte Lampe).
     candidates = narrow_by_index(candidates, normalized_query, device_tags)
-
     candidates = rank_candidates(normalized_query, candidates)
 
     if len(candidates) > 1:
         top, second = candidates[0], candidates[1]
-        # Echte Mehrdeutigkeit nur, wenn sich die Kandidaten nicht schon
-        # über den Item-Typ unterscheiden.
         if top.get("type") == second.get("type"):
             options = ", ".join(
                 f"`{c['name']}`" + (f" ({c['label']})" if c["label"] != c["name"] else "")
@@ -900,10 +839,6 @@ def resolve_single_query(user_query: str, last_item_hint: Optional[str]) -> str:
 
 
 def build_list_response(candidates: List[Dict[str, Any]]) -> str:
-    """Aufzählung für 'Welche Lampen/Geräte/Items gibt es im Bad?'. Bevorzugt
-    Gruppen-Items (repräsentieren ein ganzes Gerät wie 'Lampe1') und
-    steuerbare Punkte; blendet reine String-Hilfspunkte aus, wenn genug
-    andere Kandidaten da sind."""
     groups = [c for c in candidates if c.get("type") == "Group"]
     controllable = [c for c in candidates if c.get("type") in ("Switch", "Dimmer", "Color", "Rollershutter", "Number", "Contact")]
     shown = groups + [c for c in controllable if c not in groups]
@@ -927,7 +862,10 @@ def build_list_response(candidates: List[Dict[str, Any]]) -> str:
     return "Gefundene Geräte:\n" + "\n".join(lines)
 
 
-def execute_resolved(best_item_name: str, best_item_meta: Dict[str, Any], query_lower: str, user_query: str) -> str:
+def execute_resolved(best_item_name: str, best_item_meta: Optional[Dict[str, Any]], query_lower: str, user_query: str) -> str:
+    if not best_item_meta:
+        return f"Ich kenne das Item `{best_item_name}` nicht (nicht im Cache -- ggf. erst /api/sync ausführen)."
+
     best_item_label = best_item_meta["label"]
     item_type = best_item_meta.get("type", "")
     log.info(f"[MIDDLEWARE] Gewähltes Item: {best_item_name} ({best_item_label}) [Typ: {item_type}]")
@@ -949,24 +887,22 @@ def execute_resolved(best_item_name: str, best_item_meta: Dict[str, Any], query_
 
     if action == "OFF":
         cmd = "OFF" if item_type in ["Switch", "Dimmer"] else "DOWN"
-        status = execute_openhab_command(best_item_name, cmd)
+        status = execute_openhab_command(best_item_name, cmd, item_type)
         return f"🛑 **Befehl gesendet:**\n• **Ziel:** `{best_item_label}` (`{best_item_name}`)\n• **Kommando:** `{cmd}`\n• **Ergebnis:** {status}"
 
     if action == "ON":
         cmd = "ON" if item_type in ["Switch", "Dimmer"] else "UP"
-        status = execute_openhab_command(best_item_name, cmd)
+        status = execute_openhab_command(best_item_name, cmd, item_type)
         return f"🟢 **Befehl gesendet:**\n• **Ziel:** `{best_item_label}` (`{best_item_name}`)\n• **Kommando:** `{cmd}`\n• **Ergebnis:** {status}"
 
     numeric_value = extract_numeric_command(user_query)
     if numeric_value is not None:
-        status = execute_openhab_command(best_item_name, numeric_value)
+        status = execute_openhab_command(best_item_name, numeric_value, item_type)
         return f"🔢 **Wert geändert:**\n• **Ziel:** `{best_item_label}` (`{best_item_name}`)\n• **Neuer Wert:** `{numeric_value}`\n• **Ergebnis:** {status}"
 
     return f"🔍 Ich habe das Item `{best_item_label}` (`{best_item_name}`) gefunden. Sag mir gerne, ob ich es schalten oder abfragen soll."
 
 
-# Mehrfach-Befehle trennen ("Schalte Licht und Heizung an"). Bewusst nur auf
-# " und " gesplittet (nicht Komma), um Dezimalwerte wie "21,5 Grad" nicht zu zerreißen.
 SPLIT_PATTERN = re.compile(r"\s+und\s+", re.IGNORECASE)
 
 
@@ -1009,8 +945,8 @@ async def list_models():
 
 @app.on_event("startup")
 def on_startup():
+    load_cache_from_disk()
     if fetch_openhab_tag_registry():
         build_synonym_tables_from_openhab()
     else:
         build_synonym_tables_from_openhab()
-    rebuild_item_cache()
