@@ -84,7 +84,7 @@ actions:
   "OFF": [aus, ausschalten, deaktivieren, stoppe, "mach aus", schließe, schliesse, "off"]
   "UP": [hoch, rauf, hochfahren, oeffnen, "up"]
   "DOWN": [runter, herunter, herunterfahren, "down"]
-  "STATUS": [status, zustand, wie, wert, ist, sind, hat, läuft, laeuft, gibt, warm, kalt, grad, temperatur, prozent]
+  "STATUS": [status, zustand, wie, wert, ist, sind, hat, läuft, laeuft, gibt, warm, kalt, grad, temperatur, prozent, abfragen, abfrage, "frage ab", "frag ab", auslesen, check, checke]
 
 # Schwellenwerte für Fuzzy-Matching (RapidFuzz token_sort_ratio, 0-100)
 fuzzy:

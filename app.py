@@ -87,7 +87,7 @@ def load_synonym_config() -> Dict[str, Any]:
 
 
 SYN_CONFIG = load_synonym_config()
-FUZZY_MIN_SCORE = SYN_CONFIG.get("fuzzy", {}).get("min_score", 82)
+FUZZY_MIN_SCORE = SYN_CONFIG.get("fuzzy", {}).get("min_score", 88)
 
 DEVICE_SYNONYMS: Dict[str, Set[str]] = {}
 LOCATION_SYNONYMS: Dict[str, Set[str]] = {}
@@ -212,6 +212,11 @@ def build_synonym_tables_from_openhab():
 
 
 def resolve_tags(normalized_query: str, synonym_table: Dict[str, Set[str]]) -> Set[str]:
+    """Löst Tags gegen die Anfrage auf. Fuzzy-Matching ist bewusst STRENG
+    (Mindestlänge 4, Längendifferenz <=2, fuzz.ratio statt WRatio): WRatio
+    nutzt intern Teilstring-Heuristiken und aktiviert bei kurzen Wörtern
+    leicht falsche Tags (z.B. hat das dazu geführt, dass "Lampen" im Bad
+    auch Amazon-Music-/Webradio-Items als Kandidaten durchließ)."""
     matched: Set[str] = set()
     tokens = normalized_query.split()
     for tag, words in synonym_table.items():
@@ -222,7 +227,9 @@ def resolve_tags(normalized_query: str, synonym_table: Dict[str, Set[str]]) -> S
                 matched.add(tag)
                 break
             for token in tokens:
-                if len(token) >= 3 and fuzz.WRatio(token, w) >= FUZZY_MIN_SCORE:
+                if (len(token) >= 4 and len(w) >= 4
+                        and abs(len(token) - len(w)) <= 2
+                        and fuzz.ratio(token, w) >= FUZZY_MIN_SCORE):
                     matched.add(tag)
                     break
             else:
@@ -245,6 +252,12 @@ def resolve_action(query_lower: str) -> Optional[str]:
             return mapped
 
     if query_lower.strip().startswith(("sind ", "ist ", "hat ", "läuft ", "laeuft ", "gibt ", "wie ", "was ")):
+        return "STATUS"
+
+    # Trennbares Verb "abfragen" ("Frage es ab", "Frag das mal ab") -- die
+    # beiden Teile stehen im Hauptsatz getrennt, ein reiner Wortlisten-Check
+    # greift hier nicht.
+    if re.search(r"\bfrag\w*\b", query_lower) and re.search(r"\bab\b", query_lower):
         return "STATUS"
 
     for action in ["STATUS", "OFF", "ON", "UP", "DOWN"]:
@@ -535,6 +548,34 @@ def debug_item(item_name: str):
     return {"metadata": meta}
 
 
+@app.get("/api/resolve")
+def debug_resolve(q: str):
+    """Diagnose-Endpoint: zeigt SCHRITT FÜR SCHRITT, wie eine Anfrage
+    aufgelöst wird -- normalisierter Text, erkannte Tags/Aktion, und die
+    komplette (ungerankte) Kandidatenliste mit ihren Semantic-Feldern.
+    Beispiel: curl "http://127.0.0.1:8000/api/resolve?q=Sind%20die%20Lampen%20im%20Bad%20an%3F"
+    Damit lässt sich ein falsches/fehlendes Match direkt nachvollziehen,
+    statt es aus Chat-Antworten zu erraten."""
+    normalized_query = normalize_text(q)
+    query_lower = q.lower()
+    device_tags = resolve_tags(normalized_query, DEVICE_SYNONYMS)
+    location_tags = resolve_tags(normalized_query, LOCATION_SYNONYMS)
+    action = resolve_action(query_lower)
+    exact_name = find_exact_item_reference(q)
+
+    candidates = filter_candidates(device_tags, location_tags, action) if (device_tags or location_tags) else []
+
+    return {
+        "normalized_query": normalized_query,
+        "exact_item_reference": exact_name,
+        "resolved_device_tags": sorted(device_tags),
+        "resolved_location_tags": sorted(location_tags),
+        "resolved_action": action,
+        "candidate_count": len(candidates),
+        "candidates": candidates[:30],
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "items_cached": len(ITEM_CACHE), "tfidf_ready": _vectorizer is not None}
@@ -711,12 +752,23 @@ def _token_hits(tokens_str: str, words: Set[str]) -> bool:
 
 
 def filter_candidates(device_tags: Set[str], location_tags: Set[str], action: Optional[str]) -> List[Dict[str, Any]]:
+    """WICHTIG (Fix ggü. Vorversion): Ein Item zählt, wenn ENTWEDER die
+    aufgelösten Semantic-Tags passen ODER der wort-grenzen-sichere Text-
+    Abgleich einen Treffer liefert -- nicht mehr "Tags schlagen Text und
+    blockieren jeden Text-Fallback". Grund: reale openHAB-Installationen
+    haben oft unvollständige/inkonsistente Tag-Ketten (isPointOf zeigt auf
+    eine Gruppe ohne eigene Location, o.ä.), wodurch ein echtes Lampen-Item
+    fälschlich ausgeschlossen wurde, nur weil sein (unvollständig
+    aufgelöster) Tag nicht im Set lag. Der Bach-Kantaten-Fall aus einer
+    früheren Runde ist dadurch NICHT wieder offen, weil der Text-Abgleich
+    inzwischen wort-grenzen-sicher ist (_token_hits), nicht mehr ein roher
+    Substring-Check."""
+
     def matches_device(it: Dict[str, Any]) -> bool:
         if not device_tags:
             return True
-        has_semantic = bool(it.get("equipment_tag") or it.get("property_tag"))
-        if has_semantic:
-            return it.get("equipment_tag") in device_tags or it.get("property_tag") in device_tags
+        if it.get("equipment_tag") in device_tags or it.get("property_tag") in device_tags:
+            return True
         words = set()
         for tag in device_tags:
             words |= DEVICE_SYNONYMS.get(tag, set())
@@ -725,9 +777,8 @@ def filter_candidates(device_tags: Set[str], location_tags: Set[str], action: Op
     def matches_location(it: Dict[str, Any]) -> bool:
         if not location_tags:
             return True
-        has_semantic = bool(it.get("location_tag"))
-        if has_semantic:
-            return it.get("location_tag") in location_tags
+        if it.get("location_tag") in location_tags:
+            return True
         words = set()
         for tag in location_tags:
             words |= LOCATION_SYNONYMS.get(tag, set())
@@ -807,7 +858,14 @@ def resolve_single_query(user_query: str, last_item_hint: Optional[str]) -> str:
     location_tags = resolve_tags(normalized_query, LOCATION_SYNONYMS)
     action = resolve_action(query_lower)
 
-    is_short_followup = len(query_lower.split()) <= 4 and action and not device_tags and not location_tags
+    # Folge-Befehl: KEIN Raum/Gerät erkannt + kurze Nachricht + wir kennen
+    # bereits ein zuvor verwendetes Item -> nutze es, unabhängig davon, ob
+    # wir die genaue Aktion schon erkannt haben (das entscheidet
+    # execute_resolved() ohnehin selbst). Vorher musste zusätzlich 'action'
+    # schon feststehen, wodurch z.B. "Frage es ab" (keine erkannte Aktion)
+    # NICHT als Folgebefehl galt und stattdessen in der freien Vektorsuche
+    # über den ganzen Bestand landete.
+    is_short_followup = len(query_lower.split()) <= 5 and not device_tags and not location_tags
 
     if is_short_followup and last_item_hint:
         best_item_meta = get_item_meta(last_item_hint)
