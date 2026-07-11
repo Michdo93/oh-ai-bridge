@@ -424,10 +424,18 @@ def sync_items_to_vector_db():
     build_synonym_tables_from_openhab()
 
     try:
-        log.info("[SYNC] Rufe Items von openHAB ab (Items.getAllItems, inkl. semantics-Metadata)...")
-        items = items_api.getAllItems(metadata=".+")
+        log.info("[SYNC] Rufe Items von openHAB ab (Items.getItems, inkl. semantics-Metadata)...")
+        # WICHTIG: Die installierte python-openhab-rest-client-Version heißt
+        # die Methode tatsächlich `getItems`, nicht `getAllItems` (wie in der
+        # PyPI-/GitHub-Doku beschrieben -- Doku und Code sind hier
+        # offenbar auseinandergelaufen). Außerdem wirft die Library bei
+        # HTTP-/Verbindungsfehlern KEINE Exception, sondern gibt
+        # {"error": "..."} als normalen Rückgabewert zurück.
+        items = items_api.getItems(metadata=".+")
+        if isinstance(items, dict) and "error" in items:
+            raise ValueError(items["error"])
         if not isinstance(items, list):
-            raise ValueError(f"Unerwartetes Antwortformat von Items.getAllItems(): {type(items)}")
+            raise ValueError(f"Unerwartetes Antwortformat von Items.getItems(): {type(items)}: {items!r}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Fehler beim openHAB-Verbindungsaufbau: {str(e)}")
 
@@ -608,24 +616,35 @@ def execute_openhab_command(item_name: str, command: str, item_type: str = "") -
     if item_type and not command_allowed(item_type, command):
         return f"Abgelehnt: Befehl '{command}' passt nicht zum Item-Typ '{item_type}'."
     try:
-        items_api.sendCommand(item_name, command)
-        return "Erfolgreich geschaltet"
+        result = items_api.sendCommand(item_name, command)
     except Exception as e:
-        log.warning(f"[OPENHAB] sendCommand({item_name}, {command}) fehlgeschlagen: {e}")
+        log.warning(f"[OPENHAB] sendCommand({item_name}, {command}) hat eine Exception geworfen: {e}")
         return f"Fehler: {e}"
+    # Die Library wirft bei HTTP-/Verbindungsfehlern KEINE Exception, sondern
+    # gibt {"error": "..."} zurück (z.B. "Item not found.", "Item command
+    # null."). Erfolg kommt als {"message": "OK"}.
+    if isinstance(result, dict) and "error" in result:
+        log.warning(f"[OPENHAB] sendCommand({item_name}, {command}) fehlgeschlagen: {result['error']}")
+        return f"Fehler: {result['error']}"
+    return "Erfolgreich geschaltet"
 
 
 def get_openhab_state(item_name: str) -> str:
     try:
         result = items_api.getItemState(item_name)
-        if isinstance(result, dict):
-            return str(result.get("state", "Unbekannt"))
-        if result is None:
-            return "Unbekannt"
-        return str(result)
     except Exception as e:
-        log.warning(f"[OPENHAB] getItemState({item_name}) fehlgeschlagen: {e}")
+        log.warning(f"[OPENHAB] getItemState({item_name}) hat eine Exception geworfen: {e}")
         return "Unbekannt"
+    # Erfolg: die Library gibt den rohen State-String direkt zurück (z.B.
+    # "ON", "22.5", "NULL"), NICHT in ein dict verpackt. Ein dict deutet auf
+    # {"error": "..."} hin (z.B. Item nicht gefunden).
+    if isinstance(result, dict):
+        if "error" in result:
+            log.warning(f"[OPENHAB] getItemState({item_name}) fehlgeschlagen: {result['error']}")
+        return "Unbekannt"
+    if result is None:
+        return "Unbekannt"
+    return str(result)
 
 
 # =====================================================================

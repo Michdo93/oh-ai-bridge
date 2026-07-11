@@ -135,7 +135,7 @@ sudo systemctl start oh-ai-bridge.service
 curl -X POST http://127.0.0.1:8000/api/sync
 ```
 
-This fetches all items (via `Items.getAllItems(metadata=".+")`), resolves each item's Location/Equipment/Property classification by following the `semantics` metadata's `isPointOf`/`isPartOf` chain (falling back to `Tags.getTags()` categorization, and independently to plain word-boundary text matching), builds a TF-IDF index over the results, and persists everything to a single file (`CACHE_PATH`) so a later restart doesn't require an immediate re-sync.
+This fetches all items (via `Items.getItems(metadata=".+")` — note: despite what the library's own README/PyPI page says, the actually installed method is called `getItems`, not `getAllItems`; verify with `python3 -c "from openhab import Items; print([m for m in dir(Items) if not m.startswith('_')])"` against your installed version if in doubt), resolves each item's Location/Equipment/Property classification by following the `semantics` metadata's `isPointOf`/`isPartOf` chain (falling back to `Tags.getTags()` categorization, and independently to plain word-boundary text matching), builds a TF-IDF index over the results, and persists everything to a single file (`CACHE_PATH`) so a later restart doesn't require an immediate re-sync.
 
 ```json
 {
