@@ -2,12 +2,19 @@
 
 An ultra-fast, lightweight Python middleware designed to bridge **openHAB** with **Open WebUI** using semantic vector search on the CPU. It bypasses the need for large, resource-heavy LLMs by translating natural language into openHAB REST API commands using a local ChromaDB instance.
 
+Version 4 adds real integration with openHAB's **Semantic Model** (the same Location/Equipment tag hierarchy HABot uses), so you're no longer limited to phrasing that matches an item's literal name — "turn on the light" now works even if the item is technically named `Bedroom_Lamp_Switch`.
+
 ## Features
-- **Context-Aware Follow-up Commands:** Simple phrases like *"Turn it off"* automatically target the last used device.
+- **openHAB Semantic Model Integration:** Loads the Location/Equipment/Point tag hierarchy live from `/rest/tags` (openHAB ≥ 4.0), the same registry HABot uses. Rooms and device classes are resolved from your actual openHAB tags instead of a hardcoded keyword list.
+- **Synonym & Fuzzy Matching:** A user-editable `synonyms.yaml` extends the tags from openHAB with your own vocabulary (slang, abbreviations). RapidFuzz adds typo tolerance ("lich" → "licht") without needing an LLM.
+- **Hybrid Retrieval:** Combines precise tag-based filtering (room + device class) with vector search for ranking, instead of relying on raw text similarity alone — far fewer mix-ups between similar devices.
+- **Clarification on Ambiguity:** If two candidate devices are too close to call, the bridge asks a short follow-up question instead of guessing and triggering the wrong device.
+- **Context-Aware Follow-up Commands:** Simple phrases like *"Turn it off"* automatically target the last used device — resolved from the conversation history Open WebUI already sends, not from shared global state, so it stays correct across multiple concurrent chats/users.
+- **Multi-Command Support:** Requests like *"Turn on the light and the heating"* are split and handled individually.
 - **Strict Query Prioritization:** Differentiates between state checks (*"Are the lights on?"*) and actual toggle commands.
-- **Smart Room Filtering:** Uses regex and Umlaut-normalization (`ä` -> `ae`, etc.) to isolate search queries to specific rooms.
 - **Audio & System Variable Protection:** Prevents unwanted media library triggers when adjusting smart home equipment.
-- **Resource Efficient:** Runs entirely on the CPU using `all-MiniLM-L6-v2` embeddings.
+- **Config via `.env`:** No more editing credentials directly in `app.py`.
+- **Resource Efficient:** Still runs entirely on the CPU using `all-MiniLM-L6-v2` embeddings — no GPU, no LLM, no cloud.
 
 ---
 
@@ -81,13 +88,25 @@ pip install -r requirements.txt
 
 ### 5. Configuration
 
-Open `app.py` and configure your openHAB credentials:
+Credentials and paths are no longer hardcoded in `app.py` — copy the example environment file and fill in your values:
 
-```python
-OPENHAB_URL = "http://<YOUR_OPENHAB_IP>:8080"
-OPENHAB_TOKEN = "oh.your_actual_token_here"
-API_KEY = "your_local_key"
+```bash
+cp .env.example .env
+nano .env
 ```
+
+```ini
+OPENHAB_URL=http://<YOUR_OPENHAB_IP>:8080
+OPENHAB_TOKEN=oh.your_actual_token_here
+API_KEY=your_local_key
+SYNONYMS_PATH=./synonyms.yaml
+CHROMA_PATH=./chroma_db
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+```
+
+**Never commit your `.env` file to git.**
+
+Optionally, review `synonyms.yaml` and add any device names, room names, or German phrasing specific to your setup that openHAB's own semantic tags don't already cover (e.g. custom rooms like a "Smart-Home-Labor", or local slang for a device). This file is merged with whatever your openHAB instance reports live under `/rest/tags` — you don't need to duplicate anything openHAB already knows.
 
 ### 6. Setup systemd Service (Autostart)
 
@@ -108,6 +127,7 @@ After=network.target
 Type=simple
 User=openhab
 WorkingDirectory=/home/openhab/oh-ai-bridge
+EnvironmentFile=/home/openhab/oh-ai-bridge/.env
 ExecStart=/home/openhab/oh-ai-bridge/bin/uvicorn app:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=5
@@ -131,25 +151,66 @@ sudo systemctl start oh-ai-bridge.service
 To pull your items from openHAB into the local ChromaDB vector database, trigger the initial sync via `curl`:
 
 ```bash
-curl -X POST [http://127.0.0.1:8000/api/sync](http://127.0.0.1:8000/api/sync)
+curl -X POST http://127.0.0.1:8000/api/sync
 ```
 
 *Note: This utilizes an `upsert` mechanism. You can run this command anytime your openHAB items change without breaking existing data.*
+
+During sync, the bridge also fetches your openHAB Semantic Model (`/rest/tags`) and classifies every item by walking up its group hierarchy to find the nearest Location and Equipment tag — the same resolution logic HABot uses. The response tells you whether this succeeded:
+
+```json
+{
+  "status": "success",
+  "message": "142 Items synchronisiert.",
+  "semantic_model_source": "openhab_live",
+  "items_with_semantic_classification": 118
+}
+```
+
+If `semantic_model_source` is `yaml_fallback`, your openHAB version doesn't expose `/rest/tags` (older than 4.0, or the endpoint is disabled) — the bridge still works, falling back to the room/device synonym lists defined in `synonyms.yaml`.
+
+To see exactly how the bridge interpreted your tags (useful if room/device detection looks off), check:
+
+```bash
+curl http://127.0.0.1:8000/api/tags
+```
+
+A basic liveness check is available at:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
 
 ---
 
 ## Connecting Open WebUI
 
-(Normally it should detect this confiugrations automatically.)
+(Normally it should detect this configuration automatically.)
 
 1. Open your **Open WebUI** interface.
 2. Navigate to **Admin Settings** -> **Connections**.
 3. Under **OpenAI API**, add a connection:
 * **API URL:** `http://127.0.0.1:8000/v1` *(If Open WebUI runs in host network mode, otherwise use your VM's network IP on port 8000)*
-* **API Key:** `local-oh-key`
+* **API Key:** the value you set for `API_KEY` in your `.env`
 
 
 4. Click **Save** and **Refresh**.
 5. Select the model **`oh-hybrid-local`** from the chat dropdown and start controlling your home!
 
 ---
+
+## How Query Resolution Works
+
+1. The incoming message is normalized (lowercased, umlauts folded: `ä` → `ae`, etc.).
+2. **Device class** and **room** are resolved against your openHAB Semantic Model + `synonyms.yaml`, first via exact/substring match, then via RapidFuzz for typo tolerance.
+3. **Action** (turn on/off, raise/lower, status query, or a numeric value like a percentage or temperature) is resolved from the same normalized text — questions ("is the light on?") are prioritized over plain toggle words so status checks don't accidentally trigger a command.
+4. Candidates are retrieved from ChromaDB using progressive filtering: room + device class → device class only → room only → unfiltered vector search, so the semantic tags do the heavy lifting and the embedding model only has to rank within a small, already-relevant set.
+5. If the top two candidates are too close to distinguish, the bridge asks you to clarify instead of guessing.
+6. Follow-up commands ("turn it off") resolve the previously used device from the conversation history Open WebUI sends with every request — no shared state between different chats or users.
+
+---
+
+## Notes
+
+- The exact JSON schema of `/rest/tags` can vary slightly between openHAB versions (e.g. field names `uid` vs. `name`). The parser in `app.py` tries the common variants defensively; use `/api/tags` after your first sync to confirm rooms/devices were classified as expected, and adjust the field names in `fetch_openhab_tag_registry()` if needed for your version.
+- This project intentionally does not use an LLM, TensorFlow/Rasa/spaCy intent classifier, or a training database/admin UI — all of that would reintroduce the CPU/GPU cost this bridge is designed to avoid. `synonyms.yaml` is the lightweight, file-based equivalent.
